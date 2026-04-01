@@ -18,6 +18,13 @@
     >
       删除
     </a-button>
+    <a-button
+        type="link"
+        size="small"
+        @click="handleCopy"
+    >
+      复制路径
+    </a-button>
   </div>
 </template>
 
@@ -40,6 +47,8 @@ interface Emits {
   (e: 'download', file: FileItem): void;
 
   (e: 'delete', file: FileItem): void;
+
+  (e: 'copy', file: FileItem): void;
 }
 
 const props = defineProps<Props>();
@@ -61,6 +70,14 @@ const handleDownload = () => {
 const handleDelete = () => {
   if (props.file) {
     emit('delete', props.file);
+    hideMenu();
+  }
+};
+
+// 处理复制路径事件
+const handleCopy = () => {
+  if (props.file) {
+    emit('copy', props.file);
     hideMenu();
   }
 };

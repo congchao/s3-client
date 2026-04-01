@@ -9,6 +9,7 @@ export const getFileType = (fileName: string): FileType => {
         [FileType.Image]: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'],
         [FileType.Video]: ['mp4', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v'],
         [FileType.Text]: ['txt', 'md', 'json', 'xml', 'html', 'css', 'js', 'ts', 'vue', 'py', 'java', 'cpp', 'c', 'h', 'sql', 'log', 'yaml', 'yml'],
+        [FileType.Parquet]: ['parquet'],
         [FileType.Xlsx]: ['xlsx', 'xls'],
         [FileType.Ppt]: ['pptx', 'ppt'],
         [FileType.Pdf]: ['pdf'],
@@ -25,6 +26,11 @@ export const getFileType = (fileName: string): FileType => {
     }
 
     return FileType.Other
+}
+
+// 图标类型（避免缺失 icon）
+export const getFileIconType = (fileName: string): FileType => {
+    return getFileType(fileName)
 }
 
 // 格式化文件大小

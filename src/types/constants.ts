@@ -19,6 +19,7 @@ export enum FileType {
     Image = 'image',
     Video = 'video',
     Text = 'text',
+    Parquet = 'parquet',
     Xlsx = 'xlsx',
     Ppt = 'ppt',
     Pdf = 'pdf',

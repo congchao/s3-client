@@ -59,7 +59,7 @@
 </template>
 
 <script setup lang="ts">
-import {computed, onMounted, onUnmounted, ref} from 'vue'
+import {computed, onMounted, onUnmounted, ref, watch} from 'vue'
 import {DownloadOutlined, UploadOutlined} from '@ant-design/icons-vue'
 import {listen, UnlistenFn} from "@tauri-apps/api/event"
 import {TransferProgress} from "@/types";
@@ -83,6 +83,8 @@ const showProgressDetail = ref<boolean>(false)
 const activeTab = ref<string>('upload')
 const uploadItems = ref<TransferProgress[]>([])
 const downloadItems = ref<TransferProgress[]>([])
+const uploadNotified = ref<boolean>(false)
+const downloadNotified = ref<boolean>(false)
 let transferEvent: UnlistenFn | null = null
 let dragDropEvent: UnlistenFn | null = null
 
@@ -95,6 +97,14 @@ const summary = computed(() => {
     totalDownloads: downloadItems.value.length,
     completedDownloads: downloadItems.value.filter(item => item.progress >= 100).length
   }
+})
+
+const uploadAllCompleted = computed(() => {
+  return uploadItems.value.length > 0 && uploadItems.value.every(item => item.status === 'completed')
+})
+
+const downloadAllCompleted = computed(() => {
+  return downloadItems.value.length > 0 && downloadItems.value.every(item => item.status === 'completed')
 })
 
 // 根据当前标签页过滤项目
@@ -173,6 +183,26 @@ onMounted(async () => {
     } else {
     }
   })
+})
+
+watch(uploadAllCompleted, (val) => {
+  if (val && !uploadNotified.value) {
+    message.success('文件上传已完成')
+    uploadNotified.value = true
+  }
+  if (!val) {
+    uploadNotified.value = false
+  }
+})
+
+watch(downloadAllCompleted, (val) => {
+  if (val && !downloadNotified.value) {
+    message.success('文件下载已完成')
+    downloadNotified.value = true
+  }
+  if (!val) {
+    downloadNotified.value = false
+  }
 })
 
 onUnmounted(() => {

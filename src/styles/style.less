@@ -135,6 +135,9 @@
     display: flex;
     align-items: center;
     overflow: hidden;
+    -webkit-user-select: none; /* Safari */
+    -ms-user-select: none; /* IE 10+ 和 Edge */
+    user-select: none; /* 标准语法 */
 
     .file-icon {
       margin-right: 8px;
@@ -213,5 +216,31 @@
     &:hover {
       background-color: #f5f5f5;
     }
+  }
+}
+
+
+.full-modal {
+  .ant-modal {
+    max-width: 100%;
+    top: 0;
+    padding-bottom: 0;
+    margin: 0;
+  }
+
+  .ant-modal-content {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    border-radius: 0;
+    overflow: hidden;
+  }
+
+  .ant-modal-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    row-gap: 12px;
+    overflow: hidden;
   }
 }

@@ -20,7 +20,8 @@ import ContextMenu from '@/views/components/ContextMenu.vue'; // 导入新组件
 import {configApi} from "@/services/config.ts";
 import {fileApi} from "@/services/file.ts";
 import SvgIcon from "@/components/Svg.vue";
-import {formatFileSize, getFileType} from "@/utils/utils.ts";
+import {formatFileSize, getFileIconType, getFileType} from "@/utils/utils.ts";
+import {FileType} from "@/types/constants.ts";
 
 const route = useRoute()
 
@@ -30,6 +31,7 @@ const selectedConfig = ref<string>('')
 const currentPathParts = ref<string[]>([])
 const fileList = ref<FileItem[]>([])
 const searchValue = ref<string>('')
+const isComposing = ref<boolean>(false)
 const viewMode = ref<'list' | 'grid'>('list')
 // 预览相关状态 - 简化
 const previewVisible = ref<boolean>(false)
@@ -38,6 +40,17 @@ const transferRef = ref<InstanceType<typeof TransferIndicator> | null>(null)
 
 const currentPath = computed(() => {
   return currentPathParts.value.join('/') + "/"
+})
+const resetSearch = () => {
+  searchValue.value = ''
+}
+// 前端搜索过滤（仅当前目录列表）
+const filteredFileList = computed(() => {
+  const keyword = searchValue.value.trim().toLowerCase()
+  if (!keyword) return fileList.value
+  return fileList.value.filter((file) =>
+      file.name.toLowerCase().includes(keyword)
+  )
 })
 const getCompletePath = (file: FileItem): string => {
   let suffix = file.isDir ? "/" : "";
@@ -161,22 +174,22 @@ const refreshFiles = async (): Promise<void> => {
 
 // 搜索文件
 const onSearch = (e: KeyboardEvent) => {
-  if (e.keyCode === 229) {
-    console.log('composing')
+  if (e.keyCode === 229 || isComposing.value) {
     return
   }
-  // TODO 搜索实现
 }
 
 // 导航到根目录 - 重置分页
 const goToRoot = async (): Promise<void> => {
   currentPathParts.value = []
+  resetSearch()
   await loadFileList(false)
 }
 
 // 导航到指定路径 - 重置分页
 const navigateToPath = async (index: number): Promise<void> => {
   currentPathParts.value = currentPathParts.value.slice(0, index + 1)
+  resetSearch()
   await loadFileList(false)
 }
 
@@ -185,11 +198,12 @@ const handleFileClick = async (file: FileItem): Promise<void> => {
   if (file.isDir) {
     // 进入文件夹
     currentPathParts.value.push(file.name)
+    resetSearch()
     await loadFileList(false) // 重置分页
   } else {
     // 根据文件类型决定是否预览
     const fileType = getFileType(file.name)
-    if (['image', 'video', 'text'].includes(fileType)) {
+    if ([FileType.Image, FileType.Video, FileType.Text, FileType.Parquet].includes(fileType)) {
       await previewFileContent(file)
     } else {
       // 其他类型直接下载
@@ -231,6 +245,27 @@ const deleteFile = async (file: FileItem): Promise<void> => {
   }
 }
 
+const copyFilePath = async (file: FileItem): Promise<void> => {
+  try {
+    const fullPath = getCompletePath(file)
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(fullPath)
+    } else {
+      const textarea = document.createElement('textarea')
+      textarea.value = fullPath
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
+    message.success('已复制完整路径')
+  } catch (error) {
+    console.error('复制路径失败:', error)
+    message.error('复制路径失败')
+  }
+}
 
 const selectFiles = async () => {
   // 调用原生对话框，核心配置：同时开启 文件+文件夹 选择
@@ -276,6 +311,7 @@ const onConfigChange = async (id: string): Promise<void> => {
   await router.push({name: "FileManager", params: {id}})
   selectedConfig.value = id
   currentPathParts.value = []
+  resetSearch()
   await loadFileList()
 }
 
@@ -362,6 +398,8 @@ onUnmounted(() => {
                  placeholder="搜索文件..."
                  style="width: 200px; margin-right: 12px;"
                  @keydown.enter.prevent="onSearch"
+                 @compositionstart="isComposing = true"
+                 @compositionend="isComposing = false"
         />
         <a-flex gap="small">
           <a-button title="刷新当前目录" @click="refreshFiles" :icon="h(ReloadOutlined)"/>
@@ -392,7 +430,7 @@ onUnmounted(() => {
         </a-breadcrumb>
       </div>
       <div class="breadcrumb-right">
-        <span class="file-count">共 {{ fileList.length }} 个对象</span>
+        <span class="file-count">共 {{ filteredFileList.length }} 个对象</span>
         <a-button-group>
           <a-button
               :type="viewMode === 'list' ? 'primary' : 'default'"
@@ -412,7 +450,7 @@ onUnmounted(() => {
     <a-layout-content class="content" @scroll="handleScroll">
       <div class="file-list-container file-list-container-style">
         <div
-            v-for="file in fileList"
+            v-for="file in filteredFileList"
             :key="file.name"
             class="file-item file-item-style"
             @dblclick="handleFileClick(file)"
@@ -421,7 +459,7 @@ onUnmounted(() => {
           <div class="file-name">
             <span class="file-icon">
               <svg-icon name="directory" v-if="file.isDir"/>
-              <svg-icon :name="getFileType(file.name)" v-else/>
+              <svg-icon :name="getFileIconType(file.name)" v-else/>
             </span>
             <span class="file-text">{{ file.name }}</span>
           </div>
@@ -444,6 +482,7 @@ onUnmounted(() => {
         :file="contextMenu.file"
         @download="downloadFile"
         @delete="deleteFile"
+        @copy="copyFilePath"
     />
 
     <!-- 预览模态框 -->

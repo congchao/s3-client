@@ -31,6 +31,9 @@ const deleteFile = async (id: string, key: string): Promise<void> => {
 
 // 获取文件预览URL
 const getFilePreviewUrl = async (id: string, key: string): Promise<string> => {
+    if (key.startsWith("/")) {
+        key = key.substring(1);
+    }
     return await invoke<string>('file_get_preview_url', {id, key});
 };
 
