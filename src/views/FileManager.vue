@@ -4,16 +4,18 @@ import {useRoute} from 'vue-router'
 import {message} from 'ant-design-vue'
 import {
   AppstoreOutlined,
+  FolderAddOutlined,
+  LinkOutlined,
   MenuOutlined,
   ReloadOutlined,
   UnorderedListOutlined,
   UploadOutlined
 } from '@ant-design/icons-vue'
-import {FileItem, FileList, OssConfig} from '@/types'
+import {BucketPermissions, FileItem, FileList, OssConfig} from '@/types'
 import {open} from '@tauri-apps/plugin-dialog';
 import router from "@/router";
 import dayjs from "dayjs";
-import {hideLoading, showLoading} from '@/utils/loading.ts'
+import {showLoading} from '@/utils/loading.ts'
 import TransferIndicator, {type UploadCompletedPayload} from '@/views/components/TransferIndicator.vue'
 import FilePreviewModal from '@/views/components/FilePreviewModal.vue';
 import ContextMenu from '@/views/components/ContextMenu.vue'; // 导入新组件
@@ -38,6 +40,27 @@ const viewMode = ref<'list' | 'grid'>('list')
 const previewVisible = ref<boolean>(false)
 const previewFile = ref<FileItem | null>(null)
 const transferRef = ref<InstanceType<typeof TransferIndicator> | null>(null)
+const permissions = ref<BucketPermissions | null>(null)
+
+type ObjectOperationMode = 'mkdir' | 'rename' | 'move' | 'copy'
+
+const objectOperation = reactive({
+  visible: false,
+  loading: false,
+  mode: 'mkdir' as ObjectOperationMode,
+  title: '',
+  label: '',
+  value: '',
+  file: null as FileItem | null,
+})
+
+const shareModal = reactive({
+  visible: false,
+  loading: false,
+  expiresSeconds: 3600,
+  url: '',
+  file: null as FileItem | null,
+})
 
 const currentPath = computed(() => {
   return currentPathParts.value.length > 0 ? `${currentPathParts.value.join('/')}/` : ''
@@ -59,6 +82,39 @@ const getCompletePath = (file: FileItem): string => {
   return `${prefix}${file.name}${suffix}`
 }
 
+const canWrite = computed(() => permissions.value?.write !== false)
+const canDelete = computed(() => permissions.value?.delete !== false)
+const canRead = computed(() => permissions.value?.read !== false)
+
+const copyText = async (text: string): Promise<void> => {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+  } else {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    document.body.removeChild(textarea)
+  }
+}
+
+const joinRemotePath = (basePath: string, name: string): string => {
+  const base = basePath.trim().replace(/^\/+|\/+$/g, '')
+  const normalizedName = name.trim().replace(/^\/+|\/+$/g, '')
+  if (!base) return normalizedName
+  if (!normalizedName) return `${base}/`
+  return `${base}/${normalizedName}`
+}
+
+const withDirectorySuffix = (key: string, isDir: boolean): string => {
+  if (!isDir) return key.replace(/^\/+/, '')
+  const normalized = key.replace(/^\/+|\/+$/g, '')
+  return normalized ? `${normalized}/` : ''
+}
+
 // 预览文件 - 简化
 const previewFileContent = async (file: FileItem): Promise<void> => {
   if (file.isDir) return
@@ -76,6 +132,7 @@ const closePreview = (): void => {
 const nextToken = ref<string | null>(null)
 const hasMore = ref<boolean>(false)
 const isLoadingMore = ref<boolean>(false)
+let fileListLoadVersion = 0
 
 // 右键相关变量
 const contextMenu = reactive({
@@ -109,6 +166,7 @@ const loadConfigList = async (): Promise<void> => {
     }
 
     if (selectedConfig.value && selectedBucket.value) {
+      await loadPermissions()
       await loadFileList()
     }
   } catch (error) {
@@ -117,13 +175,31 @@ const loadConfigList = async (): Promise<void> => {
   }
 }
 
+const loadPermissions = async (): Promise<void> => {
+  if (!selectedConfig.value || !selectedBucket.value) return
+  try {
+    permissions.value = await fileApi.probePermissions(selectedConfig.value, selectedBucket.value)
+  } catch (error) {
+    console.error('权限探测失败:', error)
+    permissions.value = null
+  }
+}
+
 // 加载文件列表 - 支持分页
 const loadFileList = async (append = false): Promise<void> => {
   if (!selectedConfig.value || !selectedBucket.value) return
+  const requestVersion = ++fileListLoadVersion
+  let loadingControl: ReturnType<typeof showLoading> | null = null
 
   // 区分初始加载和上拉加载
   if (!append) {
-    showLoading('加载中...')
+    loadingControl = showLoading('加载中...', 'large', {
+      cancelText: '取消加载',
+      onCancel: () => {
+        fileListLoadVersion++
+        message.info('已取消当前加载')
+      }
+    })
     fileList.value = [] // 清空现有列表
     nextToken.value = null // 重置分页令牌
   } else {
@@ -137,6 +213,10 @@ const loadFileList = async (append = false): Promise<void> => {
         currentPath.value,
         append ? nextToken.value || '' : ''
     )
+
+    if (requestVersion !== fileListLoadVersion || loadingControl?.cancelled) {
+      return
+    }
 
     // 更新分页信息
     nextToken.value = result.nextToken
@@ -159,11 +239,14 @@ const loadFileList = async (append = false): Promise<void> => {
       fileList.value = result.objects
     }
   } catch (error) {
+    if (requestVersion !== fileListLoadVersion || loadingControl?.cancelled) {
+      return
+    }
     console.error('加载文件列表失败:', error)
     message.error('加载文件列表失败！')
   } finally {
     if (!append) {
-      hideLoading()
+      loadingControl?.close()
     } else {
       isLoadingMore.value = false
     }
@@ -182,6 +265,7 @@ const changeViewMode = (mode: 'list' | 'grid'): void => {
 
 // 刷新文件列表 - 重置分页
 const refreshFiles = async (): Promise<void> => {
+  await loadPermissions()
   await loadFileList(false) // 重新加载第一页
 }
 
@@ -240,7 +324,7 @@ const handleFileClick = async (file: FileItem): Promise<void> => {
   } else {
     // 根据文件类型决定是否预览
     const fileType = getFileType(file.name)
-    if ([FileType.Image, FileType.Video, FileType.Text, FileType.Parquet].includes(fileType)) {
+    if ([FileType.Image, FileType.Video, FileType.Text, FileType.Csv, FileType.Json, FileType.Markdown, FileType.Parquet].includes(fileType)) {
       await previewFileContent(file)
     } else {
       // 其他类型直接下载
@@ -266,20 +350,33 @@ const downloadFile = async (file: FileItem): Promise<void> => {
 
 // 删除文件
 const deleteFile = async (file: FileItem): Promise<void> => {
+  if (!canDelete.value) {
+    message.warning('当前账号没有删除权限')
+    return
+  }
+  let cancelled = false
+  const loadingControl = showLoading(`正在${file.isDir ? '递归删除目录' : '删除文件'}...`, 'large', {
+    cancelText: '取消等待',
+    onCancel: () => {
+      cancelled = true
+      message.info('已取消等待')
+    }
+  })
   try {
-    showLoading(`正在${file.isDir ? '递归删除目录' : '删除文件'}...`)
     await fileApi.deleteFile(
         selectedConfig.value,
         selectedBucket.value,
         getCompletePath(file)
     )
+    if (cancelled) return
     message.success('删除成功！')
     await loadFileList()
   } catch (error) {
+    if (cancelled) return
     console.error('删除文件失败:', error)
     message.error('删除文件失败！')
   } finally {
-    hideLoading()
+    loadingControl.close()
   }
 }
 
@@ -287,18 +384,7 @@ const copyFilePath = async (file: FileItem): Promise<void> => {
   try {
     const keyPath = getCompletePath(file)
     const fullPath = selectedBucket.value ? `${selectedBucket.value}/${keyPath}` : keyPath
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(fullPath)
-    } else {
-      const textarea = document.createElement('textarea')
-      textarea.value = fullPath
-      textarea.style.position = 'fixed'
-      textarea.style.opacity = '0'
-      document.body.appendChild(textarea)
-      textarea.select()
-      document.execCommand('copy')
-      document.body.removeChild(textarea)
-    }
+    await copyText(fullPath)
     message.success('已复制完整路径')
   } catch (error) {
     console.error('复制路径失败:', error)
@@ -306,7 +392,128 @@ const copyFilePath = async (file: FileItem): Promise<void> => {
   }
 }
 
+const ensureWritePermission = (): boolean => {
+  if (!canWrite.value) {
+    message.warning('当前账号没有写入权限')
+    return false
+  }
+  return true
+}
+
+const openObjectOperation = (mode: ObjectOperationMode, file: FileItem | null = null): void => {
+  if (!ensureWritePermission()) return
+
+  objectOperation.mode = mode
+  objectOperation.file = file
+  objectOperation.loading = false
+
+  if (mode === 'mkdir') {
+    objectOperation.title = '新建文件夹'
+    objectOperation.label = '文件夹名称'
+    objectOperation.value = ''
+  } else if (mode === 'rename' && file) {
+    objectOperation.title = '重命名'
+    objectOperation.label = '新名称'
+    objectOperation.value = file.name
+  } else if (mode === 'move' && file) {
+    objectOperation.title = '移动'
+    objectOperation.label = '目标路径'
+    objectOperation.value = getCompletePath(file)
+  } else if (mode === 'copy' && file) {
+    objectOperation.title = '复制'
+    objectOperation.label = '目标路径'
+    const sourceKey = getCompletePath(file)
+    objectOperation.value = file.isDir
+        ? sourceKey.replace(/\/$/, '-copy/')
+        : sourceKey.replace(/([^/]+)$/, 'copy-$1')
+  }
+
+  objectOperation.visible = true
+}
+
+const submitObjectOperation = async (): Promise<void> => {
+  const value = objectOperation.value.trim()
+  if (!value) {
+    message.warning('请输入有效路径')
+    return
+  }
+
+  if (objectOperation.mode === 'rename' && value.includes('/')) {
+    message.warning('重命名只支持输入名称，不支持路径')
+    return
+  }
+
+  objectOperation.loading = true
+  try {
+    if (objectOperation.mode === 'mkdir') {
+      const directoryKey = withDirectorySuffix(joinRemotePath(currentPath.value, value), true)
+      await fileApi.createDirectory(selectedConfig.value, selectedBucket.value, directoryKey)
+      message.success('文件夹创建成功')
+    } else if (objectOperation.file) {
+      const sourceKey = getCompletePath(objectOperation.file)
+      let targetKey = value
+      if (objectOperation.mode === 'rename') {
+        targetKey = joinRemotePath(currentPath.value, value)
+      }
+      targetKey = withDirectorySuffix(targetKey, objectOperation.file.isDir)
+
+      if (objectOperation.mode === 'rename' || objectOperation.mode === 'move') {
+        await fileApi.moveFile(selectedConfig.value, selectedBucket.value, sourceKey, targetKey)
+        message.success(objectOperation.mode === 'rename' ? '重命名成功' : '移动成功')
+      } else if (objectOperation.mode === 'copy') {
+        await fileApi.copyFile(selectedConfig.value, selectedBucket.value, sourceKey, targetKey)
+        message.success('复制成功')
+      }
+    }
+
+    objectOperation.visible = false
+    await refreshFiles()
+  } catch (error) {
+    console.error('对象操作失败:', error)
+    message.error(`操作失败: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    objectOperation.loading = false
+  }
+}
+
+const openShareModal = (file: FileItem): void => {
+  if (file.isDir) return
+  if (!canRead.value) {
+    message.warning('当前账号没有读取权限')
+    return
+  }
+  shareModal.file = file
+  shareModal.expiresSeconds = 3600
+  shareModal.url = ''
+  shareModal.visible = true
+}
+
+const generatePresignedUrl = async (): Promise<void> => {
+  if (!shareModal.file) return
+  shareModal.loading = true
+  try {
+    shareModal.url = await fileApi.createPresignedUrl(
+        selectedConfig.value,
+        selectedBucket.value,
+        getCompletePath(shareModal.file),
+        shareModal.expiresSeconds
+    )
+  } catch (error) {
+    console.error('生成预签名链接失败:', error)
+    message.error('生成预签名链接失败')
+  } finally {
+    shareModal.loading = false
+  }
+}
+
+const copyShareUrl = async (): Promise<void> => {
+  if (!shareModal.url) return
+  await copyText(shareModal.url)
+  message.success('链接已复制')
+}
+
 const selectFiles = async () => {
+  if (!ensureWritePermission()) return
   // 调用原生对话框，核心配置：同时开启 文件+文件夹 选择
   const res = await open({
     multiple: true,
@@ -326,6 +533,7 @@ const selectFiles = async () => {
 }
 
 const selectFolders = async () => {
+  if (!ensureWritePermission()) return
   // 调用原生对话框，核心配置：同时开启 文件+文件夹 选择
   const res = await open({
     multiple: true,
@@ -357,6 +565,7 @@ const onConfigChange = async (id: string): Promise<void> => {
   await router.push({name: "FileManager", params: {id, bucket}})
   currentPathParts.value = []
   resetSearch()
+  await loadPermissions()
   await loadFileList()
 }
 
@@ -444,6 +653,12 @@ onUnmounted(() => {
         <a-button v-if="selectedBucket" @click="goToBucketList" title="切换存储桶">
           {{ selectedBucket }}
         </a-button>
+        <a-space v-if="permissions" class="permission-tags">
+          <a-tag :color="permissions.list ? 'green' : 'red'">列出</a-tag>
+          <a-tag :color="permissions.read ? 'green' : 'red'">读取</a-tag>
+          <a-tag :color="permissions.write ? 'green' : 'red'">写入</a-tag>
+          <a-tag :color="permissions.delete ? 'green' : 'red'">删除</a-tag>
+        </a-space>
       </div>
       <div class="header-right button-group">
         <a-input class="search-input"
@@ -456,8 +671,9 @@ onUnmounted(() => {
         />
         <a-flex gap="small">
           <a-button title="刷新当前目录" @click="refreshFiles" :icon="h(ReloadOutlined)"/>
-          <a-button title="上传文件" type="primary" :icon="h(UploadOutlined)" @click="selectFiles"/>
-          <a-button title="上传文件夹" type="primary" @click="selectFolders">
+          <a-button title="新建文件夹" :disabled="!canWrite" :icon="h(FolderAddOutlined)" @click="openObjectOperation('mkdir')"/>
+          <a-button title="上传文件" type="primary" :disabled="!canWrite" :icon="h(UploadOutlined)" @click="selectFiles"/>
+          <a-button title="上传文件夹" type="primary" :disabled="!canWrite" @click="selectFolders">
             <template #icon>
               <svg-icon name="upload_directory" style="width: 20px; height: 20px;"/>
             </template>
@@ -536,7 +752,58 @@ onUnmounted(() => {
         @download="downloadFile"
         @delete="deleteFile"
         @copy="copyFilePath"
+        @rename="(file) => openObjectOperation('rename', file)"
+        @move="(file) => openObjectOperation('move', file)"
+        @duplicate="(file) => openObjectOperation('copy', file)"
+        @share="openShareModal"
     />
+
+    <a-modal
+        v-model:open="objectOperation.visible"
+        :title="objectOperation.title"
+        :confirm-loading="objectOperation.loading"
+        ok-text="确定"
+        cancel-text="取消"
+        @ok="submitObjectOperation"
+    >
+      <a-form layout="vertical">
+        <a-form-item :label="objectOperation.label">
+          <a-input
+              v-model:value="objectOperation.value"
+              :placeholder="objectOperation.mode === 'rename' ? '请输入新名称' : '请输入目标路径'"
+              @pressEnter="submitObjectOperation"
+          />
+        </a-form-item>
+      </a-form>
+    </a-modal>
+
+    <a-modal
+        v-model:open="shareModal.visible"
+        title="预签名链接"
+        :footer="null"
+    >
+      <a-form layout="vertical">
+        <a-form-item label="有效期（秒）">
+          <a-input-number
+              v-model:value="shareModal.expiresSeconds"
+              :min="1"
+              :max="604800"
+              style="width: 100%;"
+          />
+        </a-form-item>
+        <a-form-item>
+          <a-button type="primary" :loading="shareModal.loading" :icon="h(LinkOutlined)" @click="generatePresignedUrl">
+            生成链接
+          </a-button>
+        </a-form-item>
+        <a-form-item v-if="shareModal.url" label="链接">
+          <a-textarea :value="shareModal.url" :auto-size="{ minRows: 3, maxRows: 5 }" readonly/>
+        </a-form-item>
+        <a-flex v-if="shareModal.url" justify="end">
+          <a-button type="primary" @click="copyShareUrl">复制链接</a-button>
+        </a-flex>
+      </a-form>
+    </a-modal>
 
     <!-- 预览模态框 -->
     <FilePreviewModal
@@ -590,5 +857,9 @@ onUnmounted(() => {
   overflow: auto;
   background: #fff;
   padding: 4px 16px;
+}
+
+.permission-tags {
+  margin-left: 12px;
 }
 </style>

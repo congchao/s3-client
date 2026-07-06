@@ -12,6 +12,7 @@ const route = useRoute()
 const router = useRouter()
 const configId = route.params.id as string
 const loading = ref<boolean>(false)
+let loadVersion = 0
 const config = ref<OssConfig | null>(null)
 const bucketList = ref<BucketInfo[]>([])
 
@@ -54,21 +55,34 @@ const goBack = async (): Promise<void> => {
 }
 
 const loadData = async (): Promise<void> => {
+  const requestVersion = ++loadVersion
   loading.value = true
   try {
     const configs = await configApi.getConfig()
+    if (requestVersion !== loadVersion) return
     config.value = configs.find((item) => item.id === configId) || null
     if (!config.value) {
       message.error('未找到配置信息')
       return
     }
-    bucketList.value = await fileApi.listBuckets(configId)
+    const buckets = await fileApi.listBuckets(configId)
+    if (requestVersion !== loadVersion) return
+    bucketList.value = buckets
   } catch (error) {
+    if (requestVersion !== loadVersion) return
     console.error('加载桶列表失败:', error)
     message.error('加载桶列表失败！请确认当前账号具备 ListBuckets 权限')
   } finally {
-    loading.value = false
+    if (requestVersion === loadVersion) {
+      loading.value = false
+    }
   }
+}
+
+const cancelLoad = (): void => {
+  loadVersion++
+  loading.value = false
+  message.info('已停止等待')
 }
 
 onMounted(loadData)
@@ -82,6 +96,7 @@ onMounted(loadData)
         <span class="title">{{ config?.name || '桶列表' }}</span>
       </div>
       <div class="header-right">
+        <a-button v-if="loading" @click="cancelLoad">停止</a-button>
         <a-button @click="loadData" :loading="loading" :icon="h(ReloadOutlined)">刷新</a-button>
       </div>
     </a-layout-header>

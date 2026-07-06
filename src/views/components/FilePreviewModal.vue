@@ -37,19 +37,28 @@ const previewContent = ref<string>('');
 const previewType = ref<FileType>(FileType.Other);
 const textPreviewTooLarge = ref<boolean>(false);
 const parquetPreviewTooLarge = ref<boolean>(false);
-const parquetColumns = ref<{
+type PreviewColumn = {
   title: string;
   dataIndex: string;
   key: string;
   ellipsis: boolean,
-  resizable: true,
+  resizable?: true,
   width: number,
   customCell: () => { style: Record<string, string> },
   customHeaderCell: () => { style: Record<string, string> },
-}[]>([]);
+}
+
+const csvColumns = ref<PreviewColumn[]>([]);
+const csvRows = ref<Record<string, unknown>[]>([]);
+const csvTotalRows = ref<number>(0);
+const csvError = ref<string>('');
+const parquetColumns = ref<PreviewColumn[]>([]);
 const parquetRows = ref<Record<string, unknown>[]>([]);
+const parquetSourceRows = ref<Record<string, unknown>[]>([]);
 const parquetTotalRows = ref<number>(0);
-const parquetRowLimit = 200;
+const parquetSchemaRows = ref<Record<string, unknown>[]>([]);
+const parquetPage = ref<number>(1);
+const parquetPageSize = ref<number>(100);
 const parquetMaxPreviewSize = 10 * 1024 * 1024;
 const parquetColumnWidth = 200;
 const parquetColumnStyle = {
@@ -58,6 +67,11 @@ const parquetColumnStyle = {
   maxWidth: `${parquetColumnWidth}px`,
 };
 const parquetError = ref<string>('');
+const tableColumnStyle = {
+  width: '200px',
+  minWidth: '200px',
+  maxWidth: '200px',
+};
 let parquetWasmInitPromise: ReturnType<typeof initWasm> | null = null;
 const previewContainer = useTemplateRef('previewContainer')
 let tblHeight = ref<number>(0)
@@ -71,14 +85,182 @@ const previewVisible = computed<boolean>({
 // 计算属性：当前预览文件
 const previewFile = computed<FileItem | null>(() => props.file);
 
+const readPreviewText = async (): Promise<string> => {
+  if (!props.file) return '';
+  const fileData: number[] = await fileApi.downloadFile(
+      props.configId,
+      props.bucket,
+      `${props.currentPath}${props.file.name}`
+  );
+  return new TextDecoder('utf-8').decode(new Uint8Array(fileData));
+};
+
+const escapeHtml = (value: string): string => {
+  return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+};
+
+const renderInlineMarkdown = (value: string): string => {
+  let html = escapeHtml(value);
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  html = html.replace(/\[([^\]]+)]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  return html;
+};
+
+const renderMarkdown = (value: string): string => {
+  const lines = value.replace(/\r\n/g, '\n').split('\n');
+  const html: string[] = [];
+  let inCodeBlock = false;
+  let listOpen = false;
+
+  const closeList = () => {
+    if (listOpen) {
+      html.push('</ul>');
+      listOpen = false;
+    }
+  };
+
+  for (const line of lines) {
+    if (line.trim().startsWith('```')) {
+      closeList();
+      if (inCodeBlock) {
+        html.push('</code></pre>');
+      } else {
+        html.push('<pre><code>');
+      }
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+
+    if (inCodeBlock) {
+      html.push(`${escapeHtml(line)}\n`);
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      closeList();
+      const level = heading[1].length;
+      html.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    const listItem = line.match(/^\s*[-*]\s+(.*)$/);
+    if (listItem) {
+      if (!listOpen) {
+        html.push('<ul>');
+        listOpen = true;
+      }
+      html.push(`<li>${renderInlineMarkdown(listItem[1])}</li>`);
+      continue;
+    }
+
+    closeList();
+    if (line.trim()) {
+      html.push(`<p>${renderInlineMarkdown(line)}</p>`);
+    }
+  }
+
+  closeList();
+  if (inCodeBlock) html.push('</code></pre>');
+  return html.join('');
+};
+
+const parseDelimitedText = (value: string, delimiter: string): string[][] => {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    const next = value[i + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        cell += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === delimiter && !inQuotes) {
+      row.push(cell);
+      cell = '';
+    } else if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && next === '\n') i += 1;
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else {
+      cell += char;
+    }
+  }
+
+  if (cell || row.length > 0) {
+    row.push(cell);
+    rows.push(row);
+  }
+
+  return rows.filter((item) => item.some((cellValue) => cellValue !== ''));
+};
+
+const buildTableColumn = (name: string, index: number): PreviewColumn => ({
+  title: name || `列 ${index + 1}`,
+  dataIndex: `col_${index}`,
+  key: `col_${index}`,
+  ellipsis: true,
+  width: 200,
+  customCell: () => ({style: tableColumnStyle}),
+  customHeaderCell: () => ({style: tableColumnStyle}),
+});
+
+const formatComplexCellValue = (value: unknown): unknown => {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'bigint') return value.toString();
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Uint8Array) return `Uint8Array(${value.length})`;
+  if (Array.isArray(value) || typeof value === 'object') {
+    return JSON.stringify(value, (_key, nestedValue) => {
+      if (typeof nestedValue === 'bigint') return nestedValue.toString();
+      if (nestedValue instanceof Date) return nestedValue.toISOString();
+      if (nestedValue instanceof Uint8Array) return `Uint8Array(${nestedValue.length})`;
+      return nestedValue;
+    });
+  }
+  return value;
+};
+
+const updateParquetPageRows = (): void => {
+  const start = (parquetPage.value - 1) * parquetPageSize.value;
+  const rows = parquetSourceRows.value.slice(start, start + parquetPageSize.value);
+  parquetRows.value = rows.map((row, index) => ({
+    __key: start + index,
+    ...row,
+  }));
+};
+
 // 预览文件内容
 const previewFileContent = async (): Promise<void> => {
   if (!props.file || props.file.isDir) return;
 
   previewLoading.value = true;
+  csvColumns.value = [];
+  csvRows.value = [];
+  csvTotalRows.value = 0;
+  csvError.value = '';
   parquetColumns.value = [];
   parquetRows.value = [];
+  parquetSourceRows.value = [];
   parquetTotalRows.value = 0;
+  parquetSchemaRows.value = [];
+  parquetPage.value = 1;
   parquetError.value = '';
   textPreviewTooLarge.value = false;
   parquetPreviewTooLarge.value = false;
@@ -87,7 +269,7 @@ const previewFileContent = async (): Promise<void> => {
 
   try {
 
-    if (fileType === FileType.Text) {
+    if ([FileType.Text, FileType.Csv, FileType.Json, FileType.Markdown].includes(fileType)) {
       const size = props.file.size ?? 0;
       const maxSize = 5 * 1024 * 1024;
       if (size > maxSize) {
@@ -96,17 +278,32 @@ const previewFileContent = async (): Promise<void> => {
         previewType.value = fileType;
         return;
       }
-      // 对于文本文件，需要下载内容进行预览
-      const fileData: number[] = await fileApi.downloadFile(
-          props.configId,
-          props.bucket,
-          `${props.currentPath}${props.file.name}`
-      );
 
-      // 转换为文本内容
-      const uint8Array = new Uint8Array(fileData);
-      const decoder = new TextDecoder('utf-8');
-      previewContent.value = decoder.decode(uint8Array);
+      const text = await readPreviewText();
+      if (fileType === FileType.Json) {
+        previewContent.value = JSON.stringify(JSON.parse(text), null, 2);
+      } else if (fileType === FileType.Markdown) {
+        previewContent.value = renderMarkdown(text);
+      } else if (fileType === FileType.Csv) {
+        const delimiter = props.file.name.toLowerCase().endsWith('.tsv') ? '\t' : ',';
+        const rows = parseDelimitedText(text, delimiter);
+        if (rows.length === 0) {
+          csvError.value = 'CSV 内容为空';
+        } else {
+          const headers = rows[0].map((header, index) => header || `列 ${index + 1}`);
+          csvColumns.value = headers.map(buildTableColumn);
+          csvRows.value = rows.slice(1).map((row, rowIndex) => {
+            const record: Record<string, unknown> = {__key: rowIndex};
+            headers.forEach((_header, index) => {
+              record[`col_${index}`] = row[index] ?? '';
+            });
+            return record;
+          });
+          csvTotalRows.value = csvRows.value.length;
+        }
+      } else {
+        previewContent.value = text;
+      }
     } else if (fileType === FileType.Image || fileType === FileType.Video) {
       // 对于图片和视频，获取授权访问链接
       previewContent.value = await fileApi.getFilePreviewUrl(
@@ -137,7 +334,14 @@ const previewFileContent = async (): Promise<void> => {
       const wasmTable = readParquet(parquetBuffer);
       const arrowTable = tableFromIPC(wasmTable.intoIPCStream());
 
-      const fieldNames = arrowTable.schema.fields.map((f: { name: string }) => f.name);
+      const fields = arrowTable.schema.fields;
+      const fieldNames = fields.map((f: { name: string }) => f.name);
+      parquetSchemaRows.value = fields.map((field: { name: string; type: unknown; nullable?: boolean }, index: number) => ({
+        __key: index,
+        name: field.name,
+        type: String(field.type),
+        nullable: field.nullable ? '是' : '否',
+      }));
       parquetColumns.value = fieldNames.map((name: string) => ({
         title: name,
         dataIndex: name,
@@ -149,34 +353,16 @@ const previewFileContent = async (): Promise<void> => {
         customHeaderCell: () => ({style: parquetColumnStyle}),
       }));
 
-      const stringifyCellValue = (value: unknown): string => {
-        return JSON.stringify(value, (_key, nestedValue) => {
-          if (typeof nestedValue === 'bigint') return nestedValue.toString();
-          if (nestedValue instanceof Date) return nestedValue.toISOString();
-          if (nestedValue instanceof Uint8Array) return `Uint8Array(${nestedValue.length})`;
-          return nestedValue;
-        });
-      };
-
-      const formatCellValue = (value: unknown): unknown => {
-        if (value === null || value === undefined) return '';
-        if (typeof value === 'bigint') return value.toString();
-        if (value instanceof Date) return value.toISOString();
-        if (value instanceof Uint8Array) return `Uint8Array(${value.length})`;
-        if (Array.isArray(value)) return stringifyCellValue(value);
-        if (typeof value === 'object') return stringifyCellValue(value);
-        return value;
-      };
-
       const allRows = arrowTable.toArray();
       parquetTotalRows.value = allRows.length;
-      parquetRows.value = allRows.slice(0, parquetRowLimit).map((row: Record<string, unknown>, index: number) => {
-        const record: Record<string, unknown> = {__key: index};
+      parquetSourceRows.value = allRows.map((row: Record<string, unknown>) => {
+        const record: Record<string, unknown> = {};
         for (const name of fieldNames) {
-          record[name] = formatCellValue((row as Record<string, unknown>)[name]);
+          record[name] = formatComplexCellValue((row as Record<string, unknown>)[name]);
         }
         return record;
       });
+      updateParquetPageRows();
     }
 
     previewType.value = fileType;
@@ -208,9 +394,16 @@ const closePreview = (): void => {
   previewType.value = FileType.Other;
   textPreviewTooLarge.value = false;
   parquetPreviewTooLarge.value = false;
+  csvColumns.value = [];
+  csvRows.value = [];
+  csvTotalRows.value = 0;
+  csvError.value = '';
   parquetColumns.value = [];
   parquetRows.value = [];
+  parquetSourceRows.value = [];
   parquetTotalRows.value = 0;
+  parquetSchemaRows.value = [];
+  parquetPage.value = 1;
   parquetError.value = '';
   emit('close');
 };
@@ -283,6 +476,39 @@ watch(
         <pre class="preview-text" :class="{ 'preview-text-muted': textPreviewTooLarge }">{{ previewContent }}</pre>
       </div>
 
+      <!-- JSON 预览 -->
+      <div v-if="previewType === FileType.Json" class="preview-text-container">
+        <pre class="preview-text">{{ previewContent }}</pre>
+      </div>
+
+      <!-- Markdown 预览 -->
+      <div v-if="previewType === FileType.Markdown" class="preview-markdown-container">
+        <article class="preview-markdown" v-html="previewContent"></article>
+      </div>
+
+      <!-- CSV 预览 -->
+      <div v-if="previewType === FileType.Csv" class="preview-csv-container">
+        <div v-if="csvError" class="preview-parquet-error">
+          <p>{{ csvError }}</p>
+        </div>
+        <div v-else class="preview-csv-content">
+          <div class="preview-parquet-meta">
+            <span>共 {{ csvTotalRows }} 行</span>
+          </div>
+          <a-table
+              class="fixed-preview-table"
+              :columns="csvColumns"
+              :data-source="csvRows"
+              :pagination="{ pageSize: 100, showSizeChanger: true }"
+              bordered
+              size="small"
+              row-key="__key"
+              table-layout="fixed"
+              :scroll="{ x: 'max-content', y: tblHeight }"
+          />
+        </div>
+      </div>
+
       <!-- Parquet 预览 -->
       <div v-if="previewType === FileType.Parquet" class="preview-parquet-container">
         <div v-if="parquetPreviewTooLarge" class="preview-parquet-large">
@@ -297,12 +523,13 @@ watch(
           <p>Parquet 解析失败：{{ parquetError }}</p>
         </div>
         <div class="preview-parquet-content" v-else>
+          <a-tabs size="small">
+            <a-tab-pane key="data" tab="数据">
           <div class="preview-parquet-meta">
             <span>共 {{ parquetTotalRows }} 行</span>
-            <span v-if="parquetTotalRows > parquetRowLimit">仅预览前 {{ parquetRowLimit }} 行</span>
           </div>
           <a-table
-              class="parquet-preview-table"
+              class="fixed-preview-table parquet-preview-table"
               :columns="parquetColumns"
               :data-source="parquetRows"
               :pagination="false"
@@ -312,6 +539,35 @@ watch(
               table-layout="fixed"
               :scroll="{ x:  'max-content',y: tblHeight }"
           />
+          <a-flex class="parquet-pagination" justify="end">
+            <a-pagination
+                v-model:current="parquetPage"
+                v-model:page-size="parquetPageSize"
+                :total="parquetTotalRows"
+                :page-size-options="['50', '100', '200', '500']"
+                show-size-changer
+                show-less-items
+                @change="updateParquetPageRows"
+                @showSizeChange="updateParquetPageRows"
+            />
+          </a-flex>
+            </a-tab-pane>
+            <a-tab-pane key="schema" tab="Schema">
+              <a-table
+                  :columns="[
+                    { title: '字段名', dataIndex: 'name', key: 'name' },
+                    { title: '类型', dataIndex: 'type', key: 'type' },
+                    { title: '允许为空', dataIndex: 'nullable', key: 'nullable', width: 120 }
+                  ]"
+                  :data-source="parquetSchemaRows"
+                  :pagination="false"
+                  bordered
+                  size="small"
+                  row-key="__key"
+                  :scroll="{ y: tblHeight }"
+              />
+            </a-tab-pane>
+          </a-tabs>
         </div>
       </div>
 
@@ -379,6 +635,49 @@ watch(
   }
 }
 
+.preview-markdown-container {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  padding: 24px;
+  background: #fff;
+}
+
+.preview-markdown {
+  max-width: 920px;
+  margin: 0 auto;
+  color: #1f2328;
+  line-height: 1.7;
+
+  :deep(h1), :deep(h2), :deep(h3), :deep(h4), :deep(h5), :deep(h6) {
+    margin: 18px 0 10px;
+    font-weight: 600;
+  }
+
+  :deep(p) {
+    margin: 0 0 12px;
+  }
+
+  :deep(pre) {
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 12px;
+    overflow: auto;
+  }
+
+  :deep(code) {
+    background: #f6f8fa;
+    border-radius: 4px;
+    padding: 2px 4px;
+  }
+}
+
+.preview-csv-container, .preview-csv-content {
+  width: 100%;
+  height: 100%;
+}
+
 .preview-other-container {
   display: flex;
   flex-direction: column;
@@ -412,27 +711,27 @@ watch(
   color: #666;
 }
 
-.preview-parquet-content {
-  :deep(.parquet-preview-table .ant-table table) {
+.preview-parquet-content, .preview-csv-content {
+  :deep(.fixed-preview-table .ant-table table) {
     table-layout: fixed !important;
   }
 
-  :deep(.parquet-preview-table .ant-table) {
+  :deep(.fixed-preview-table .ant-table) {
     border-color: #d9d9d9;
   }
 
-  :deep(.parquet-preview-table .ant-table-thead > tr > th) {
+  :deep(.fixed-preview-table .ant-table-thead > tr > th) {
     border-color: #d9d9d9;
     background: #fafafa;
     font-weight: 600;
   }
 
-  :deep(.parquet-preview-table .ant-table-tbody > tr > td) {
+  :deep(.fixed-preview-table .ant-table-tbody > tr > td) {
     border-color: #e5e5e5;
   }
 
-  :deep(.parquet-preview-table .ant-table-thead > tr > th),
-  :deep(.parquet-preview-table .ant-table-tbody > tr > td) {
+  :deep(.fixed-preview-table .ant-table-thead > tr > th),
+  :deep(.fixed-preview-table .ant-table-tbody > tr > td) {
     width: 200px !important;
     min-width: 200px !important;
     max-width: 200px !important;
@@ -440,6 +739,10 @@ watch(
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+}
+
+.parquet-pagination {
+  padding-top: 12px;
 }
 
 .preview-container {

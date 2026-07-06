@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "package:mac:arm64": "bash scripts/build-macos-arm64.sh",
+    "package:mac:x64": "bash scripts/build-macos-x64.sh",
+    "package:win:amd64": "powershell -ExecutionPolicy Bypass -File scripts/build-windows-amd64.ps1"
   },
   "dependencies": {
     "@ant-design/icons-vue": "^7.0.1",

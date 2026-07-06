@@ -29,6 +29,13 @@ export interface BucketInfo {
     creationDate: string | null
 }
 
+export interface BucketPermissions {
+    list: boolean
+    read: boolean
+    write: boolean
+    delete: boolean
+}
+
 export interface TransferProgress {
     id: string
     config_id: string

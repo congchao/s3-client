@@ -56,6 +56,14 @@
             >
               ×
             </button>
+            <button
+                v-if="canRetry(item)"
+                class="retry-button"
+                title="重试"
+                @click="retryTransfer(item)"
+            >
+              重试
+            </button>
           </div>
         </div>
       </div>
@@ -194,12 +202,33 @@ const canCancel = (item: TransferProgress): boolean => {
   return ['waiting', 'uploading', 'downloading'].includes(item.status)
 }
 
+const canRetry = (item: TransferProgress): boolean => {
+  return item.status === 'failed'
+}
+
 const cancelTransfer = async (taskId: string) => {
   try {
     await fileApi.cancelTransfer(taskId)
   } catch (error) {
     console.error('取消传输失败:', error)
     message.error('取消传输失败')
+  }
+}
+
+const retryTransfer = async (item: TransferProgress) => {
+  try {
+    const transferType = uploadItems.value.some((uploadItem) => uploadItem.id === item.id) ? 'upload' : 'download'
+    const retried = await fileApi.retryTransfer(item, transferType)
+    if (transferType === 'upload') {
+      const index = uploadItems.value.findIndex((uploadItem) => uploadItem.id === item.id)
+      if (index >= 0) uploadItems.value[index] = retried
+    } else {
+      const index = downloadItems.value.findIndex((downloadItem) => downloadItem.id === item.id)
+      if (index >= 0) downloadItems.value[index] = retried
+    }
+  } catch (error) {
+    console.error('重试传输失败:', error)
+    message.error('重试传输失败')
   }
 }
 
@@ -451,7 +480,7 @@ defineExpose({
           }
         }
 
-        .cancel-button {
+.cancel-button {
           width: 22px;
           height: 22px;
           border: 1px solid #d9d9d9;
@@ -469,6 +498,20 @@ defineExpose({
         }
       }
     }
+  }
+}
+
+.retry-button {
+  border: 1px solid #1677ff;
+  background: #fff;
+  color: #1677ff;
+  border-radius: 4px;
+  padding: 2px 6px;
+  cursor: pointer;
+  font-size: 12px;
+
+  &:hover {
+    background: #e6f4ff;
   }
 }
 

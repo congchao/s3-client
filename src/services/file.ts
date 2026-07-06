@@ -1,6 +1,6 @@
 import {invoke} from "@tauri-apps/api/core";
 import {listen, UnlistenFn} from "@tauri-apps/api/event";
-import {BucketInfo, FileList, TransferProgress} from "@/types";
+import {BucketInfo, BucketPermissions, FileList, TransferProgress} from "@/types";
 
 // 获取文件列表
 const listFile = async (
@@ -62,8 +62,50 @@ const listBuckets = async (id: string): Promise<BucketInfo[]> => {
     return await invoke<BucketInfo[]>('bucket_list', {id});
 };
 
+const probePermissions = async (id: string, bucket: string): Promise<BucketPermissions> => {
+    return await invoke<BucketPermissions>('bucket_probe_permissions', {id, bucket});
+};
+
+const createDirectory = async (id: string, bucket: string, key: string): Promise<void> => {
+    return await invoke<void>('file_create_directory', {id, bucket, key});
+};
+
+const copyFile = async (
+    id: string,
+    bucket: string,
+    sourceKey: string,
+    targetKey: string
+): Promise<void> => {
+    return await invoke<void>('file_copy', {id, bucket, sourceKey, targetKey});
+};
+
+const moveFile = async (
+    id: string,
+    bucket: string,
+    sourceKey: string,
+    targetKey: string
+): Promise<void> => {
+    return await invoke<void>('file_move', {id, bucket, sourceKey, targetKey});
+};
+
+const createPresignedUrl = async (
+    id: string,
+    bucket: string,
+    key: string,
+    expiresSeconds: number
+): Promise<string> => {
+    return await invoke<string>('file_create_presigned_url', {id, bucket, key, expiresSeconds});
+};
+
 const cancelTransfer = async (taskId: string): Promise<void> => {
     return await invoke<void>('file_transfer_cancel', {taskId});
+};
+
+const retryTransfer = async (
+    task: TransferProgress,
+    transferType: 'upload' | 'download'
+): Promise<TransferProgress> => {
+    return await invoke<TransferProgress>('file_transfer_retry', {task, transferType});
 };
 
 // 监听传输进度事件
@@ -82,7 +124,13 @@ export const fileApi = {
     getFilePreviewUrl,
     uploadFile,
     listBuckets,
+    probePermissions,
+    createDirectory,
+    copyFile,
+    moveFile,
+    createPresignedUrl,
     cancelTransfer,
+    retryTransfer,
     listenTransferProgress,
     downloadFilePath
 };

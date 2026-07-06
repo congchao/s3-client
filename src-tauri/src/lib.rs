@@ -27,13 +27,19 @@ pub fn run() {
             commands::config_delete,
             commands::config_test,
             commands::bucket_list,
+            commands::bucket_probe_permissions,
             commands::file_list,
             commands::file_download,
             commands::file_delete,
             commands::file_get_preview_url,
+            commands::file_create_presigned_url,
+            commands::file_create_directory,
+            commands::file_copy,
+            commands::file_move,
             commands::file_upload,
             commands::file_download_path,
             commands::file_transfer_cancel,
+            commands::file_transfer_retry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

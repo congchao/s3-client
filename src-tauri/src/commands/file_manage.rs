@@ -1,5 +1,5 @@
 use crate::models::{TransferProgress, TransferStatus};
-use crate::utils::{BucketInfo, FileList, Oss};
+use crate::utils::{BucketInfo, BucketPermissions, FileList, Oss};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -344,9 +344,71 @@ pub async fn file_get_preview_url(
 }
 
 #[tauri::command]
+pub async fn file_create_presigned_url(
+    id: String,
+    bucket: String,
+    key: String,
+    expires_seconds: u64,
+) -> Result<String, String> {
+    if expires_seconds == 0 || expires_seconds > 7 * 24 * 60 * 60 {
+        return Err("链接有效期必须在 1 秒到 7 天之间".to_string());
+    }
+
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
+    oss.get_presigned_url(&bucket, &key, Duration::from_secs(expires_seconds))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn bucket_list(id: String) -> Result<Vec<BucketInfo>, String> {
     let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
     oss.list_buckets().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn bucket_probe_permissions(
+    id: String,
+    bucket: String,
+) -> Result<BucketPermissions, String> {
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
+    oss.probe_permissions(&bucket)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn file_create_directory(id: String, bucket: String, key: String) -> Result<(), String> {
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
+    oss.create_directory(&bucket, &key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn file_copy(
+    id: String,
+    bucket: String,
+    source_key: String,
+    target_key: String,
+) -> Result<(), String> {
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
+    oss.copy_object_or_directory(&bucket, &source_key, &target_key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn file_move(
+    id: String,
+    bucket: String,
+    source_key: String,
+    target_key: String,
+) -> Result<(), String> {
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
+    oss.move_object_or_directory(&bucket, &source_key, &target_key)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -503,6 +565,39 @@ pub async fn file_transfer_cancel(task_id: String) -> Result<(), String> {
         .ok_or_else(|| "未找到可取消的传输任务".to_string())?;
     token.cancel();
     Ok(())
+}
+
+#[tauri::command]
+pub async fn file_transfer_retry(
+    mut task: TransferProgress,
+    transfer_type: String,
+    app_handle: AppHandle,
+) -> Result<TransferProgress, String> {
+    task.progress = 0.0;
+    task.status = TransferStatus::Waiting;
+
+    let cancellation_token = register_transfer_task(&task.id)?;
+    let job = TransferJob {
+        task: task.clone(),
+        app: app_handle,
+        cancellation_token,
+    };
+
+    let result = match transfer_type.as_str() {
+        "upload" => TRANSFER_SYSTEM.upload_tx.try_send(job),
+        "download" => TRANSFER_SYSTEM.download_tx.try_send(job),
+        _ => {
+            unregister_transfer_task(&task.id);
+            return Err("未知传输类型".to_string());
+        }
+    };
+
+    if let Err(e) = result {
+        unregister_transfer_task(&task.id);
+        return Err(format!("传输队列已满，无法重试任务: {}", e));
+    }
+
+    Ok(task)
 }
 
 fn create_download_task(

@@ -5,15 +5,37 @@ import {Spin} from 'ant-design-vue'
 // 存储 loading 节点和容器
 let loadingNode: any = null
 let loadingContainer: HTMLElement | null = null
+let loadingMount: HTMLElement | null = null
+let loadingId = 0
+
+interface LoadingOptions {
+    cancelText?: string
+    onCancel?: () => void
+}
+
+export interface LoadingControl {
+    id: number
+    cancelled: boolean
+    close: () => void
+}
 
 /**
  * 显示全局 loading
  * @param text 提示文字
  * @param size 尺寸（small | default | large）
  */
-export const showLoading = (text = '加载中...', size = 'large') => {
+export const showLoading = (
+    text = '加载中...',
+    size = 'large',
+    options: LoadingOptions = {}
+): LoadingControl => {
     // 避免重复创建
-    if (loadingContainer) return
+    if (loadingContainer) {
+        hideLoading()
+    }
+
+    const currentId = ++loadingId
+    let cancelled = false
 
     // 创建容器
     loadingContainer = document.createElement('div')
@@ -29,6 +51,16 @@ export const showLoading = (text = '加载中...', size = 'large') => {
     loadingContainer.style.zIndex = '9999'
     document.body.appendChild(loadingContainer)
 
+    const content = document.createElement('div')
+    content.style.display = 'flex'
+    content.style.flexDirection = 'column'
+    content.style.alignItems = 'center'
+    content.style.gap = '16px'
+    loadingContainer.appendChild(content)
+
+    loadingMount = document.createElement('div')
+    content.appendChild(loadingMount)
+
     // 创建 Spin 组件
     loadingNode = createVNode(Spin, {
         spinning: true,
@@ -36,20 +68,49 @@ export const showLoading = (text = '加载中...', size = 'large') => {
         tip: text
     })
     // 渲染组件到容器
-    render(loadingNode, loadingContainer)
+    render(loadingNode, loadingMount)
+
+    if (options.onCancel) {
+        const cancelButton = document.createElement('button')
+        cancelButton.type = 'button'
+        cancelButton.textContent = options.cancelText || '取消'
+        cancelButton.style.border = '1px solid #d9d9d9'
+        cancelButton.style.background = '#fff'
+        cancelButton.style.borderRadius = '6px'
+        cancelButton.style.padding = '4px 14px'
+        cancelButton.style.cursor = 'pointer'
+        cancelButton.style.color = '#333'
+        cancelButton.onclick = () => {
+            cancelled = true
+            options.onCancel?.()
+            closeLoading(currentId)
+        }
+        content.appendChild(cancelButton)
+    }
+
+    return {
+        id: currentId,
+        get cancelled() {
+            return cancelled
+        },
+        close: () => closeLoading(currentId),
+    }
+}
+
+const closeLoading = (id?: number) => {
+    if (id && id !== loadingId) return
+    if (loadingContainer && loadingNode && loadingMount) {
+        render(null, loadingMount)
+        document.body.removeChild(loadingContainer)
+        loadingContainer = null
+        loadingMount = null
+        loadingNode = null
+    }
 }
 
 /**
  * 隐藏全局 loading
  */
 export const hideLoading = () => {
-    if (loadingContainer && loadingNode) {
-        // 卸载组件
-        render(null, loadingContainer)
-        // 移除容器
-        document.body.removeChild(loadingContainer)
-        // 重置状态
-        loadingContainer = null
-        loadingNode = null
-    }
+    closeLoading()
 }

@@ -8,7 +8,10 @@ export const getFileType = (fileName: string): FileType => {
     const fileExtensions: Record<FileType, string[]> = {
         [FileType.Image]: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'],
         [FileType.Video]: ['mp4', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v'],
-        [FileType.Text]: ['txt', 'md', 'json', 'xml', 'html', 'css', 'js', 'ts', 'vue', 'py', 'java', 'cpp', 'c', 'h', 'sql', 'log', 'yaml', 'yml'],
+        [FileType.Text]: ['txt', 'xml', 'html', 'css', 'js', 'ts', 'vue', 'py', 'java', 'cpp', 'c', 'h', 'sql', 'log', 'yaml', 'yml'],
+        [FileType.Csv]: ['csv', 'tsv'],
+        [FileType.Json]: ['json'],
+        [FileType.Markdown]: ['md', 'markdown'],
         [FileType.Parquet]: ['parquet'],
         [FileType.Xlsx]: ['xlsx', 'xls'],
         [FileType.Ppt]: ['pptx', 'ppt'],
@@ -30,7 +33,11 @@ export const getFileType = (fileName: string): FileType => {
 
 // 图标类型（避免缺失 icon）
 export const getFileIconType = (fileName: string): FileType => {
-    return getFileType(fileName)
+    const fileType = getFileType(fileName)
+    if ([FileType.Csv, FileType.Json, FileType.Markdown].includes(fileType)) {
+        return FileType.Text
+    }
+    return fileType
 }
 
 // 格式化文件大小

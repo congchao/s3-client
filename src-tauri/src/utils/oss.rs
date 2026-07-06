@@ -54,6 +54,15 @@ pub struct BucketInfo {
     pub creation_date: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BucketPermissions {
+    pub list: bool,
+    pub read: bool,
+    pub write: bool,
+    pub delete: bool,
+}
+
 pub struct Oss {
     pub client: Client,
 }
@@ -179,6 +188,28 @@ impl Oss {
             .await?)
     }
 
+    pub async fn create_directory(
+        &self,
+        bucket: &str,
+        directory_path: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let directory_key = Self::normalize_directory_prefix(directory_path);
+        if directory_key.is_empty() {
+            return Err("文件夹名称不能为空".into());
+        }
+
+        self.client
+            .put_object()
+            .bucket(bucket)
+            .key(directory_key)
+            .body(ByteStream::from_static(b""))
+            .content_length(0)
+            .send()
+            .await?;
+
+        Ok(())
+    }
+
     async fn _delete_object(
         &self,
         bucket: &str,
@@ -225,6 +256,22 @@ impl Oss {
         } else {
             format!("{}/", directory_path)
         }
+    }
+
+    fn encode_copy_source(bucket: &str, key: &str) -> String {
+        fn encode_segment(input: &str) -> String {
+            input
+                .bytes()
+                .map(|byte| match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                        (byte as char).to_string()
+                    }
+                    _ => format!("%{:02X}", byte),
+                })
+                .collect()
+        }
+
+        format!("{}/{}", bucket, encode_segment(key))
     }
 
     async fn delete_directory_recursive(
@@ -321,6 +368,76 @@ impl Oss {
             }
         }
 
+        Ok(())
+    }
+
+    fn replace_prefix(key: &str, source_prefix: &str, target_prefix: &str) -> String {
+        key.strip_prefix(source_prefix)
+            .map(|suffix| format!("{}{}", target_prefix, suffix))
+            .unwrap_or_else(|| target_prefix.to_string())
+    }
+
+    pub async fn copy_object_or_directory(
+        &self,
+        bucket: &str,
+        source_key: &str,
+        target_key: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let source_key = source_key.trim_start_matches('/');
+        let target_key = target_key.trim_start_matches('/');
+        if source_key.is_empty() || target_key.is_empty() {
+            return Err("源路径和目标路径不能为空".into());
+        }
+        if source_key == target_key {
+            return Err("源路径和目标路径不能相同".into());
+        }
+
+        match self.get_object_type(bucket, source_key).await? {
+            ObjectType::Directory => {
+                let source_prefix = Self::normalize_directory_prefix(source_key);
+                let target_prefix = Self::normalize_directory_prefix(target_key);
+                let keys = self.list_all_object_keys(bucket, &source_prefix).await?;
+                for key in keys {
+                    let new_key = Self::replace_prefix(&key, &source_prefix, &target_prefix);
+                    self.copy_single_object(bucket, &key, &new_key).await?;
+                }
+                self.create_directory(bucket, &target_prefix).await?;
+            }
+            ObjectType::Object => {
+                self.copy_single_object(bucket, source_key, target_key)
+                    .await?;
+            }
+            ObjectType::NotFound => return Err("源对象不存在".into()),
+        }
+
+        Ok(())
+    }
+
+    async fn copy_single_object(
+        &self,
+        bucket: &str,
+        source_key: &str,
+        target_key: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.client
+            .copy_object()
+            .bucket(bucket)
+            .key(target_key)
+            .copy_source(Self::encode_copy_source(bucket, source_key))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn move_object_or_directory(
+        &self,
+        bucket: &str,
+        source_key: &str,
+        target_key: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.copy_object_or_directory(bucket, source_key, target_key)
+            .await?;
+        self.delete_object(bucket, source_key).await?;
         Ok(())
     }
 
@@ -490,6 +607,57 @@ impl Oss {
             .collect();
 
         Ok(buckets)
+    }
+
+    pub async fn probe_permissions(
+        &self,
+        bucket: &str,
+    ) -> Result<BucketPermissions, Box<dyn Error + Send + Sync>> {
+        let probe_key = format!(".s3-client-permission-probe/{}.tmp", uuid::Uuid::new_v4());
+        let list_result = self.list_objects(bucket, Some(""), Some(1), None).await;
+        let list = list_result.is_ok();
+        let delete = self._delete_object(bucket, &probe_key).await.is_ok();
+
+        let read_existing = if let Ok(file_list) = list_result {
+            if let Some(file) = file_list.objects.iter().find(|file| !file.is_dir) {
+                self.get_object(bucket, &file.name).await.is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let write = if delete {
+            self.client
+                .put_object()
+                .bucket(bucket)
+                .key(&probe_key)
+                .body(ByteStream::from_static(b""))
+                .content_length(0)
+                .send()
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+
+        let read = if write {
+            self.get_object(bucket, &probe_key).await.is_ok()
+        } else {
+            read_existing
+        };
+
+        if write {
+            let _ = self._delete_object(bucket, &probe_key).await;
+        }
+
+        Ok(BucketPermissions {
+            list,
+            read,
+            write,
+            delete,
+        })
     }
 
     /**

@@ -14,6 +14,35 @@
     <a-button
         type="link"
         size="small"
+        @click="handleRename"
+    >
+      重命名
+    </a-button>
+    <a-button
+        type="link"
+        size="small"
+        @click="handleMove"
+    >
+      移动
+    </a-button>
+    <a-button
+        type="link"
+        size="small"
+        @click="handleDuplicate"
+    >
+      复制对象
+    </a-button>
+    <a-button
+        v-if="!file?.isDir"
+        type="link"
+        size="small"
+        @click="handleShare"
+    >
+      预签名链接
+    </a-button>
+    <a-button
+        type="link"
+        size="small"
         @click="handleDelete"
     >
       删除
@@ -49,6 +78,14 @@ interface Emits {
   (e: 'delete', file: FileItem): void;
 
   (e: 'copy', file: FileItem): void;
+
+  (e: 'rename', file: FileItem): void;
+
+  (e: 'move', file: FileItem): void;
+
+  (e: 'duplicate', file: FileItem): void;
+
+  (e: 'share', file: FileItem): void;
 }
 
 const props = defineProps<Props>();
@@ -78,6 +115,34 @@ const handleDelete = () => {
 const handleCopy = () => {
   if (props.file) {
     emit('copy', props.file);
+    hideMenu();
+  }
+};
+
+const handleRename = () => {
+  if (props.file) {
+    emit('rename', props.file);
+    hideMenu();
+  }
+};
+
+const handleMove = () => {
+  if (props.file) {
+    emit('move', props.file);
+    hideMenu();
+  }
+};
+
+const handleDuplicate = () => {
+  if (props.file) {
+    emit('duplicate', props.file);
+    hideMenu();
+  }
+};
+
+const handleShare = () => {
+  if (props.file) {
+    emit('share', props.file);
     hideMenu();
   }
 };
