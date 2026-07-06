@@ -35,19 +35,29 @@ const previewLoading = ref<boolean>(false);
 const previewContent = ref<string>('');
 const previewType = ref<FileType>(FileType.Other);
 const textPreviewTooLarge = ref<boolean>(false);
+const parquetPreviewTooLarge = ref<boolean>(false);
 const parquetColumns = ref<{
   title: string;
   dataIndex: string;
   key: string;
   ellipsis: boolean,
   resizable: true,
-  width: number
+  width: number,
+  customCell: () => { style: Record<string, string> },
+  customHeaderCell: () => { style: Record<string, string> },
 }[]>([]);
 const parquetRows = ref<Record<string, unknown>[]>([]);
 const parquetTotalRows = ref<number>(0);
 const parquetRowLimit = 200;
+const parquetMaxPreviewSize = 10 * 1024 * 1024;
+const parquetColumnWidth = 200;
+const parquetColumnStyle = {
+  width: `${parquetColumnWidth}px`,
+  minWidth: `${parquetColumnWidth}px`,
+  maxWidth: `${parquetColumnWidth}px`,
+};
 const parquetError = ref<string>('');
-let parquetWasmInitPromise: Promise<void> | null = null;
+let parquetWasmInitPromise: ReturnType<typeof initWasm> | null = null;
 const previewContainer = useTemplateRef('previewContainer')
 let tblHeight = ref<number>(0)
 
@@ -70,6 +80,7 @@ const previewFileContent = async (): Promise<void> => {
   parquetTotalRows.value = 0;
   parquetError.value = '';
   textPreviewTooLarge.value = false;
+  parquetPreviewTooLarge.value = false;
 
   const fileType = getFileType(props.file.name);
 
@@ -101,6 +112,13 @@ const previewFileContent = async (): Promise<void> => {
           `${props.currentPath}${props.file.name.replace('/', '')}`
       );
     } else if (fileType === FileType.Parquet) {
+      const size = props.file.size ?? 0;
+      if (size > parquetMaxPreviewSize) {
+        parquetPreviewTooLarge.value = true;
+        previewType.value = fileType;
+        return;
+      }
+
       const fileData: number[] = await fileApi.downloadFile(
           props.configId,
           `${props.currentPath}${props.file.name}`
@@ -115,13 +133,16 @@ const previewFileContent = async (): Promise<void> => {
       const wasmTable = readParquet(parquetBuffer);
       const arrowTable = tableFromIPC(wasmTable.intoIPCStream());
 
-      const fieldNames = arrowTable.schema.fields.map((f) => f.name);
-      parquetColumns.value = fieldNames.map((name) => ({
+      const fieldNames = arrowTable.schema.fields.map((f: { name: string }) => f.name);
+      parquetColumns.value = fieldNames.map((name: string) => ({
         title: name,
         dataIndex: name,
         key: name,
         ellipsis: true,
-        width: 150,
+        resizable: true,
+        width: parquetColumnWidth,
+        customCell: () => ({style: parquetColumnStyle}),
+        customHeaderCell: () => ({style: parquetColumnStyle}),
       }));
 
       const formatCellValue = (value: unknown): unknown => {
@@ -136,7 +157,7 @@ const previewFileContent = async (): Promise<void> => {
 
       const allRows = arrowTable.toArray();
       parquetTotalRows.value = allRows.length;
-      parquetRows.value = allRows.slice(0, parquetRowLimit).map((row, index) => {
+      parquetRows.value = allRows.slice(0, parquetRowLimit).map((row: Record<string, unknown>, index: number) => {
         const record: Record<string, unknown> = {__key: index};
         for (const name of fieldNames) {
           record[name] = formatCellValue((row as Record<string, unknown>)[name]);
@@ -157,9 +178,8 @@ const previewFileContent = async (): Promise<void> => {
     }
   } finally {
     previewLoading.value = false;
-    nextTick(() => {
+    await nextTick(() => {
       tblHeight.value = (previewContainer.value?.clientHeight || 450) - 65
-      console.log(tblHeight.value)
     })
   }
 };
@@ -174,6 +194,7 @@ const closePreview = (): void => {
   previewContent.value = '';
   previewType.value = FileType.Other;
   textPreviewTooLarge.value = false;
+  parquetPreviewTooLarge.value = false;
   parquetColumns.value = [];
   parquetRows.value = [];
   parquetTotalRows.value = 0;
@@ -251,7 +272,15 @@ watch(
 
       <!-- Parquet 预览 -->
       <div v-if="previewType === FileType.Parquet" class="preview-parquet-container">
-        <div v-if="parquetError" class="preview-parquet-error">
+        <div v-if="parquetPreviewTooLarge" class="preview-parquet-large">
+          <FileOutlined :style="{ fontSize: '48px', color: '#1890ff' }"/>
+          <p>文件超过 10MB，暂不支持在线预览</p>
+          <a-button type="primary" @click="downloadPreviewFile">
+            <DownloadOutlined/>
+            点击下载
+          </a-button>
+        </div>
+        <div v-else-if="parquetError" class="preview-parquet-error">
           <p>Parquet 解析失败：{{ parquetError }}</p>
         </div>
         <div class="preview-parquet-content" v-else>
@@ -260,11 +289,14 @@ watch(
             <span v-if="parquetTotalRows > parquetRowLimit">仅预览前 {{ parquetRowLimit }} 行</span>
           </div>
           <a-table
+              class="parquet-preview-table"
               :columns="parquetColumns"
               :data-source="parquetRows"
               :pagination="false"
+              bordered
               size="small"
               row-key="__key"
+              table-layout="fixed"
               :scroll="{ x:  'max-content',y: tblHeight }"
           />
         </div>
@@ -355,6 +387,46 @@ watch(
 .preview-parquet-container, .preview-parquet-content {
   width: 100%;
   height: 100%;
+}
+
+.preview-parquet-large {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: #666;
+}
+
+.preview-parquet-content {
+  :deep(.parquet-preview-table .ant-table table) {
+    table-layout: fixed !important;
+  }
+
+  :deep(.parquet-preview-table .ant-table) {
+    border-color: #d9d9d9;
+  }
+
+  :deep(.parquet-preview-table .ant-table-thead > tr > th) {
+    border-color: #d9d9d9;
+    background: #fafafa;
+    font-weight: 600;
+  }
+
+  :deep(.parquet-preview-table .ant-table-tbody > tr > td) {
+    border-color: #e5e5e5;
+  }
+
+  :deep(.parquet-preview-table .ant-table-thead > tr > th),
+  :deep(.parquet-preview-table .ant-table-tbody > tr > td) {
+    width: 200px !important;
+    min-width: 200px !important;
+    max-width: 200px !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }
 
 .preview-container {

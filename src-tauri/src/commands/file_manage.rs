@@ -1,36 +1,55 @@
-use crate::models::TransferProgress;
+use crate::models::{TransferProgress, TransferStatus};
 use crate::utils::{FileList, Oss};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::fs;
 use tokio::sync::{mpsc, Semaphore};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 // 限制最大并发数为 5
 const MAX_CONCURRENT: usize = 5;
+const TRANSFER_QUEUE_CAPACITY: usize = 1000;
+const PREVIEW_DOWNLOAD_MAX_SIZE: i64 = 5 * 1024 * 1024;
+
+struct TransferJob {
+    task: TransferProgress,
+    app: AppHandle,
+    cancellation_token: CancellationToken,
+}
 
 // 全局发送端，用于将任务发送给后台消费者
 struct TransferSystem {
-    upload_tx: mpsc::UnboundedSender<(TransferProgress, AppHandle)>,
-    download_tx: mpsc::UnboundedSender<(TransferProgress, AppHandle)>,
+    upload_tx: mpsc::Sender<TransferJob>,
+    download_tx: mpsc::Sender<TransferJob>,
 }
+
+static TRANSFER_CANCELLATIONS: LazyLock<Mutex<HashMap<String, CancellationToken>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // 使用 LazyLock 初始化全局单例
 static TRANSFER_SYSTEM: LazyLock<TransferSystem> = LazyLock::new(|| {
-    let (upload_tx, mut upload_rx) = mpsc::unbounded_channel::<(TransferProgress, AppHandle)>();
-    let (download_tx, mut download_rx) = mpsc::unbounded_channel::<(TransferProgress, AppHandle)>();
+    let (upload_tx, mut upload_rx) = mpsc::channel::<TransferJob>(TRANSFER_QUEUE_CAPACITY);
+    let (download_tx, mut download_rx) = mpsc::channel::<TransferJob>(TRANSFER_QUEUE_CAPACITY);
 
     tokio::spawn(async move {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
-        while let Some((task, app)) = upload_rx.recv().await {
+        while let Some(job) = upload_rx.recv().await {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             tokio::spawn(async move {
+                let TransferJob {
+                    task,
+                    app,
+                    cancellation_token,
+                } = job;
                 // 执行上传
-                if let Err(e) = perform_upload(task.clone(), app).await {
+                if let Err(e) = perform_upload(task.clone(), app, cancellation_token).await {
                     eprintln!("上传任务失败: {}, 错误: {}", task.from_path, e);
                 }
+                unregister_transfer_task(&task.id);
                 // 任务结束，Drop permit 自动释放信号量
                 drop(permit);
             });
@@ -39,13 +58,19 @@ static TRANSFER_SYSTEM: LazyLock<TransferSystem> = LazyLock::new(|| {
 
     tokio::spawn(async move {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
-        while let Some((task, app)) = download_rx.recv().await {
+        while let Some(job) = download_rx.recv().await {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             tokio::spawn(async move {
+                let TransferJob {
+                    task,
+                    app,
+                    cancellation_token,
+                } = job;
                 // 执行下载
-                if let Err(e) = perform_download(task.clone(), app).await {
+                if let Err(e) = perform_download(task.clone(), app, cancellation_token).await {
                     eprintln!("下载任务失败: {}, 错误: {}", task.from_path, e);
                 }
+                unregister_transfer_task(&task.id);
                 drop(permit);
             });
         }
@@ -57,11 +82,40 @@ static TRANSFER_SYSTEM: LazyLock<TransferSystem> = LazyLock::new(|| {
     }
 });
 
-async fn perform_upload(mut task: TransferProgress, app: AppHandle) -> Result<(), String> {
-    let oss = Oss::new(&task.config_id).map_err(|e| e.to_string())?;
+fn register_transfer_task(task_id: &str) -> Result<CancellationToken, String> {
+    let token = CancellationToken::new();
+    let mut cancellations = TRANSFER_CANCELLATIONS
+        .lock()
+        .map_err(|e| format!("传输任务状态锁错误: {}", e))?;
+    cancellations.insert(task_id.to_string(), token.clone());
+    Ok(token)
+}
+
+fn unregister_transfer_task(task_id: &str) {
+    if let Ok(mut cancellations) = TRANSFER_CANCELLATIONS.lock() {
+        cancellations.remove(task_id);
+    }
+}
+
+fn emit_cancelled(mut task: TransferProgress, app: AppHandle) {
+    task.status = TransferStatus::Cancelled;
+    let _ = app.emit("transfer_process", task);
+}
+
+async fn perform_upload(
+    mut task: TransferProgress,
+    app: AppHandle,
+    cancellation_token: CancellationToken,
+) -> Result<(), String> {
+    if cancellation_token.is_cancelled() {
+        emit_cancelled(task, app);
+        return Ok(());
+    }
+
+    let oss = Oss::new_cached(&task.config_id).map_err(|e| e.to_string())?;
 
     // 发送开始状态
-    task.status = "uploading".to_string();
+    task.status = TransferStatus::Uploading;
     let _ = app.emit("transfer_process", &task);
 
     let task_clone = task.clone();
@@ -79,27 +133,41 @@ async fn perform_upload(mut task: TransferProgress, app: AppHandle) -> Result<()
                 }
                 if v.progress >= 100.0 {
                     v.progress = 100.0;
-                    v.status = "completed".to_string();
+                    v.status = TransferStatus::Completed;
                 }
                 // 忽略 emit 错误，防止日志刷屏
                 let _ = app_clone.emit("transfer_process", v);
             })),
+            cancellation_token.clone(),
         )
         .await;
 
     if let Err(e) = result {
-        task.status = "failed".to_string();
+        if cancellation_token.is_cancelled() {
+            emit_cancelled(task, app);
+            return Ok(());
+        }
+        task.status = TransferStatus::Failed;
         let _ = app.emit("transfer_process", task);
         return Err(format!("上传失败: {}", e));
     }
     Ok(())
 }
 
-async fn perform_download(mut task: TransferProgress, app: AppHandle) -> Result<(), String> {
-    let oss = Oss::new(&task.config_id).map_err(|e| e.to_string())?;
+async fn perform_download(
+    mut task: TransferProgress,
+    app: AppHandle,
+    cancellation_token: CancellationToken,
+) -> Result<(), String> {
+    if cancellation_token.is_cancelled() {
+        emit_cancelled(task, app);
+        return Ok(());
+    }
+
+    let oss = Oss::new_cached(&task.config_id).map_err(|e| e.to_string())?;
 
     // 发送开始状态
-    task.status = "downloading".to_string();
+    task.status = TransferStatus::Downloading;
     let _ = app.emit("transfer_process", &task);
 
     let task_clone = task.clone();
@@ -116,15 +184,20 @@ async fn perform_download(mut task: TransferProgress, app: AppHandle) -> Result<
                 }
                 if v.progress >= 100.0 {
                     v.progress = 100.0;
-                    v.status = "completed".to_string();
+                    v.status = TransferStatus::Completed;
                 }
                 let _ = app_clone.emit("transfer_process", v);
             }),
+            cancellation_token.clone(),
         )
         .await;
 
     if let Err(e) = result {
-        task.status = "failed".to_string();
+        if cancellation_token.is_cancelled() {
+            emit_cancelled(task, app);
+            return Ok(());
+        }
+        task.status = TransferStatus::Failed;
         let _ = app.emit("transfer_process", task);
         return Err(format!("下载失败: {}", e));
     }
@@ -146,8 +219,13 @@ async fn collect_files(root_paths: Vec<String>) -> Result<Vec<(String, String)>,
             let rel_path = current_path
                 .strip_prefix(base_root.parent().unwrap_or(&base_root)) // 保留选择的目录名本身
                 .unwrap_or(&current_path)
-                .to_string_lossy()
-                .to_string();
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
 
             result.push((current_path.to_string_lossy().to_string(), rel_path));
         } else if current_path.is_dir() {
@@ -160,13 +238,69 @@ async fn collect_files(root_paths: Vec<String>) -> Result<Vec<(String, String)>,
     Ok(result)
 }
 
+fn build_upload_key(remote_path: &str, rel_path: &str) -> String {
+    let remote_path = remote_path.trim_matches('/');
+    if remote_path.is_empty() {
+        rel_path.to_string()
+    } else {
+        format!("{}/{}", remote_path, rel_path.trim_start_matches('/'))
+    }
+}
+
+fn parent_remote_prefix(key: &str) -> String {
+    let normalized = key.trim_matches('/');
+    normalized
+        .rfind('/')
+        .map(|index| normalized[..index].to_string())
+        .unwrap_or_default()
+}
+
+fn relative_key<'a>(key: &'a str, base_remote: &str) -> &'a str {
+    let key = key.trim_matches('/');
+    let base_remote = base_remote.trim_matches('/');
+
+    if base_remote.is_empty() {
+        return key;
+    }
+
+    key.strip_prefix(base_remote)
+        .and_then(|relative| relative.strip_prefix('/'))
+        .unwrap_or(key)
+}
+
+fn safe_local_destination(
+    local_root: &str,
+    base_remote: &str,
+    key: &str,
+) -> Result<PathBuf, String> {
+    let relative = relative_key(key, base_remote);
+    if relative.is_empty() {
+        return Err("下载路径不能为空".to_string());
+    }
+
+    let mut local_dest = PathBuf::from(local_root);
+    for segment in relative.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains('\\')
+            || Path::new(segment).is_absolute()
+        {
+            return Err(format!("非法对象路径: {}", key));
+        }
+        local_dest.push(segment);
+    }
+
+    Ok(local_dest)
+}
+
 #[tauri::command]
 pub async fn file_list(
     id: String,
     path: Option<String>,
     next_token: Option<String>,
 ) -> Result<FileList, String> {
-    let oss = Oss::new(&id).map_err(|e| format!("OSS init failed: {}", e))?;
+    let oss = Oss::new_cached(&id).map_err(|e| format!("OSS init failed: {}", e))?;
     oss.list_objects(path.as_deref(), Some(1000), next_token.as_deref())
         .await
         .map_err(|e| e.to_string())
@@ -174,21 +308,24 @@ pub async fn file_list(
 
 #[tauri::command]
 pub async fn file_download(id: String, path: String) -> Result<Vec<u8>, String> {
-    let oss = Oss::new(&id).map_err(|e| e.to_string())?;
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
     let response = oss.get_object(&path).await.map_err(|e| e.to_string())?;
+    if response.content_length().unwrap_or(0) > PREVIEW_DOWNLOAD_MAX_SIZE {
+        return Err("文件过大，请使用下载功能保存到本地".to_string());
+    }
     let body = response.body.collect().await.map_err(|e| e.to_string())?;
     Ok(body.into_bytes().to_vec())
 }
 
 #[tauri::command]
 pub async fn file_delete(id: String, key: String) -> Result<(), String> {
-    let oss = Oss::new(&id).map_err(|e| e.to_string())?;
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
     oss.delete_object(&key).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn file_get_preview_url(id: String, key: String) -> Result<String, String> {
-    let oss = Oss::new(&id).map_err(|e| e.to_string())?;
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
     oss.get_presigned_url(&key, Duration::from_secs(3600))
         .await
         .map_err(|e| e.to_string())
@@ -209,6 +346,13 @@ pub async fn file_upload(
         return Err("未找到可上传的文件".to_string());
     }
 
+    if files_to_process.len() > TRANSFER_QUEUE_CAPACITY {
+        return Err(format!(
+            "传输队列最多支持 {} 个等待任务",
+            TRANSFER_QUEUE_CAPACITY
+        ));
+    }
+
     let mut tasks = Vec::new();
 
     for (full_path, rel_path) in files_to_process {
@@ -219,15 +363,7 @@ pub async fn file_upload(
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        let final_key = if remote_path.is_empty() {
-            rel_path.clone()
-        } else {
-            format!(
-                "{}/{}",
-                remote_path.strip_suffix("/").unwrap_or(&remote_path),
-                rel_path
-            )
-        };
+        let final_key = build_upload_key(&remote_path, &rel_path);
 
         let task = TransferProgress {
             id: Uuid::new_v4().to_string(),
@@ -237,16 +373,29 @@ pub async fn file_upload(
             to_path: final_key,
             size: fs::metadata(&full_path).await.map(|m| m.len()).unwrap_or(0),
             progress: 0.0,
-            status: "waiting".to_string(),
+            status: TransferStatus::Waiting,
         };
         tasks.push(task);
     }
 
     // 3. 将任务推送到全局通道
+    if tasks.len() > TRANSFER_SYSTEM.upload_tx.capacity() {
+        return Err(format!(
+            "上传队列剩余容量不足，当前最多还能添加 {} 个任务",
+            TRANSFER_SYSTEM.upload_tx.capacity()
+        ));
+    }
+
     for task in &tasks {
-        let _ = TRANSFER_SYSTEM
-            .upload_tx
-            .send((task.clone(), app_handle.clone()));
+        let cancellation_token = register_transfer_task(&task.id)?;
+        if let Err(e) = TRANSFER_SYSTEM.upload_tx.try_send(TransferJob {
+            task: task.clone(),
+            app: app_handle.clone(),
+            cancellation_token,
+        }) {
+            unregister_transfer_task(&task.id);
+            return Err(format!("传输队列已满，无法添加上传任务: {}", e));
+        }
     }
 
     // 4. 立即返回任务列表给前端，让前端渲染列表
@@ -265,27 +414,20 @@ pub async fn file_download_path(
     }
 
     let mut tasks = Vec::new();
-    let oss = Oss::new(&id).map_err(|e| e.to_string())?;
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
 
     // 1. 展开所有文件 (如果是文件夹)
     for remote_key in remote_keys {
         // 注意：这里需要确定 remote_basic 用于计算相对路径
-        let remote_basic = Path::new(&remote_key)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let remote_basic = parent_remote_prefix(&remote_key);
         if remote_key.ends_with('/') {
             // 是目录，递归列出（这里保留递归查找，但建议后端OSS有前缀搜索能力）
-            let all = oss.list_all_objects(&remote_key).await;
-            for obj in all.unwrap().objects {
-                if !obj.is_dir {
-                    tasks.push(create_download_task(
-                        &id,
-                        &obj.name,
-                        &remote_basic,
-                        &local_path,
-                    ));
-                }
+            let all_keys = oss
+                .list_all_object_keys(&remote_key)
+                .await
+                .map_err(|e| e.to_string())?;
+            for key in all_keys {
+                tasks.push(create_download_task(&id, &key, &remote_basic, &local_path)?);
             }
         } else {
             tasks.push(create_download_task(
@@ -293,7 +435,7 @@ pub async fn file_download_path(
                 &remote_key,
                 &remote_basic,
                 &local_path,
-            ));
+            )?);
         }
     }
 
@@ -301,13 +443,38 @@ pub async fn file_download_path(
     // 实际创建目录建议放到 perform_download 内部或者这里统一处理
 
     // 3. 发送到下载队列
+    if tasks.len() > TRANSFER_SYSTEM.download_tx.capacity() {
+        return Err(format!(
+            "下载队列剩余容量不足，当前最多还能添加 {} 个任务",
+            TRANSFER_SYSTEM.download_tx.capacity()
+        ));
+    }
+
     for task in &tasks {
-        let _ = TRANSFER_SYSTEM
-            .download_tx
-            .send((task.clone(), app_handle.clone()));
+        let cancellation_token = register_transfer_task(&task.id)?;
+        if let Err(e) = TRANSFER_SYSTEM.download_tx.try_send(TransferJob {
+            task: task.clone(),
+            app: app_handle.clone(),
+            cancellation_token,
+        }) {
+            unregister_transfer_task(&task.id);
+            return Err(format!("传输队列已满，无法添加下载任务: {}", e));
+        }
     }
 
     Ok(tasks)
+}
+
+#[tauri::command]
+pub async fn file_transfer_cancel(task_id: String) -> Result<(), String> {
+    let cancellations = TRANSFER_CANCELLATIONS
+        .lock()
+        .map_err(|e| format!("传输任务状态锁错误: {}", e))?;
+    let token = cancellations
+        .get(&task_id)
+        .ok_or_else(|| "未找到可取消的传输任务".to_string())?;
+    token.cancel();
+    Ok(())
 }
 
 fn create_download_task(
@@ -315,12 +482,10 @@ fn create_download_task(
     key: &str,
     base_remote: &str,
     local_root: &str,
-) -> TransferProgress {
-    // 简单的路径计算
-    let relative = key.trim_start_matches(base_remote).trim_start_matches('/');
-    let local_dest = Path::new(local_root).join(relative);
+) -> Result<TransferProgress, String> {
+    let local_dest = safe_local_destination(local_root, base_remote, key)?;
 
-    TransferProgress {
+    Ok(TransferProgress {
         id: Uuid::new_v4().to_string(),
         config_id: id.to_string(),
         name: Path::new(key)
@@ -332,6 +497,41 @@ fn create_download_task(
         to_path: local_dest.to_string_lossy().to_string(),
         size: 0,
         progress: 0.0,
-        status: "waiting".to_string(),
+        status: TransferStatus::Waiting,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_upload_key, safe_local_destination};
+    use std::path::PathBuf;
+
+    #[test]
+    fn builds_upload_key_for_bucket_root() {
+        assert_eq!(build_upload_key("", "file.txt"), "file.txt");
+        assert_eq!(build_upload_key("/", "file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn builds_upload_key_for_nested_prefix() {
+        assert_eq!(build_upload_key("dir", "file.txt"), "dir/file.txt");
+        assert_eq!(build_upload_key("dir/", "file.txt"), "dir/file.txt");
+        assert_eq!(
+            build_upload_key("/dir/sub/", "file.txt"),
+            "dir/sub/file.txt"
+        );
+    }
+
+    #[test]
+    fn builds_safe_download_path() {
+        let path = safe_local_destination("/tmp/download", "dir", "dir/sub/file.txt").unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/download/sub/file.txt"));
+    }
+
+    #[test]
+    fn rejects_unsafe_download_path() {
+        assert!(safe_local_destination("/tmp/download", "", "../secret.txt").is_err());
+        assert!(safe_local_destination("/tmp/download", "", "dir/../secret.txt").is_err());
+        assert!(safe_local_destination("/tmp/download", "", "dir\\secret.txt").is_err());
     }
 }

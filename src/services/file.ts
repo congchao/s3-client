@@ -54,6 +54,10 @@ const downloadFilePath = async (
     return await invoke<TransferProgress[]>('file_download_path', {id, remoteKeys, localPath});
 };
 
+const cancelTransfer = async (taskId: string): Promise<void> => {
+    return await invoke<void>('file_transfer_cancel', {taskId});
+};
+
 // 监听传输进度事件
 const listenTransferProgress = async (
     callback: (progress: TransferProgress) => void
@@ -69,6 +73,7 @@ export const fileApi = {
     deleteFile,
     getFilePreviewUrl,
     uploadFile,
+    cancelTransfer,
     listenTransferProgress,
     downloadFilePath
 };

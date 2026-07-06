@@ -32,5 +32,5 @@ export interface TransferProgress {
     to_path: string
     size: number
     progress: number
-    status: string
+    status: 'waiting' | 'uploading' | 'downloading' | 'completed' | 'failed' | 'cancelled'
 }

@@ -5,15 +5,17 @@ use crate::utils::Oss;
 // 配置管理命令
 #[tauri::command]
 pub async fn config_save(config: OssConfig) -> Result<(), String> {
+    let config_id = config.id.clone();
     let mut app_config = APP_CONFIG.lock().map_err(|e| e.to_string())?;
-    app_config.update(config).expect("更新失败");
+    app_config.update(config).map_err(|e| e.to_string())?;
+    Oss::clear_cached_config(&config_id);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn config_get() -> Result<Vec<OssConfig>, String> {
     let app_config = APP_CONFIG.lock().map_err(|e| e.to_string())?;
-    Ok(app_config.oss.clone())
+    app_config.list().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -23,7 +25,10 @@ pub async fn config_delete(id: String) -> Result<(), String> {
         .map_err(|e| format!("配置锁错误: {}", e))?;
 
     match app_config.remove(&id) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            Oss::clear_cached_config(&id);
+            Ok(())
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -34,7 +39,10 @@ pub async fn config_test(config: OssConfig) -> Result<bool, String> {
     let oss = Oss::new_with_config(&config);
 
     match oss {
-        Ok(oss_instance) => match oss_instance.list_objects(Option::from(""), Option::from(1), None).await {
+        Ok(oss_instance) => match oss_instance
+            .list_objects(Option::from(""), Option::from(1), None)
+            .await
+        {
             Ok(_) => {
                 println!("连接测试成功: {}", config.name);
                 Ok(true)

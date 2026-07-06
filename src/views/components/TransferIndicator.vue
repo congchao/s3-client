@@ -48,6 +48,14 @@
             </div>
             <div class="progress-percent">{{ Math.round(item.progress) }}%</div>
             <div class="status-badge" :class="item.status">{{ item.status }}</div>
+            <button
+                v-if="canCancel(item)"
+                class="cancel-button"
+                title="取消传输"
+                @click="cancelTransfer(item.id)"
+            >
+              ×
+            </button>
           </div>
         </div>
       </div>
@@ -67,6 +75,11 @@ import {getCurrentWebviewWindow} from "@tauri-apps/api/webviewWindow";
 import {fileApi} from "@/services/file.ts";
 import {message} from "ant-design-vue";
 
+export interface UploadCompletedPayload {
+  configId: string
+  uploadPath: string
+}
+
 // 定义 props
 interface Props {
   config_id: string,
@@ -77,6 +90,9 @@ const props = withDefaults(defineProps<Props>(), {
   config_id: "",
   upload_path: "",
 })
+const emit = defineEmits<{
+  (e: 'upload-completed', payload: UploadCompletedPayload): void
+}>()
 
 // 状态变量
 const showProgressDetail = ref<boolean>(false)
@@ -87,6 +103,42 @@ const uploadNotified = ref<boolean>(false)
 const downloadNotified = ref<boolean>(false)
 let transferEvent: UnlistenFn | null = null
 let dragDropEvent: UnlistenFn | null = null
+
+interface UploadBatch {
+  configId: string
+  uploadPath: string
+  taskIds: Set<string>
+  notified: boolean
+}
+
+const uploadBatches = new Map<string, UploadBatch>()
+const uploadTaskBatchMap = new Map<string, string>()
+
+const normalizeRemotePath = (path: string): string => {
+  const normalized = path.trim().replace(/^\/+|\/+$/g, '')
+  return normalized ? `${normalized}/` : ''
+}
+
+const notifyCompletedUploadBatch = (progress: TransferProgress): void => {
+  const batchId = uploadTaskBatchMap.get(progress.id)
+  if (!batchId) return
+
+  const batch = uploadBatches.get(batchId)
+  if (!batch || batch.notified) return
+
+  const completed = Array.from(batch.taskIds).every((taskId) => {
+    const item = uploadItems.value.find((uploadItem) => uploadItem.id === taskId)
+    return item?.status === 'completed'
+  })
+
+  if (completed) {
+    batch.notified = true
+    emit('upload-completed', {
+      configId: batch.configId,
+      uploadPath: batch.uploadPath
+    })
+  }
+}
 
 
 // 计算摘要信息
@@ -100,11 +152,11 @@ const summary = computed(() => {
 })
 
 const uploadAllCompleted = computed(() => {
-  return uploadItems.value.length > 0 && uploadItems.value.every(item => item.status === 'completed')
+  return uploadItems.value.length > 0 && uploadItems.value.every(item => isFinished(item))
 })
 
 const downloadAllCompleted = computed(() => {
-  return downloadItems.value.length > 0 && downloadItems.value.every(item => item.status === 'completed')
+  return downloadItems.value.length > 0 && downloadItems.value.every(item => isFinished(item))
 })
 
 // 根据当前标签页过滤项目
@@ -129,13 +181,40 @@ const switchTab = (tab: string) => {
   activeTab.value = tab
 }
 
+const isFinished = (item: TransferProgress): boolean => {
+  return ['completed', 'failed', 'cancelled'].includes(item.status)
+}
+
+const canCancel = (item: TransferProgress): boolean => {
+  return ['waiting', 'uploading', 'downloading'].includes(item.status)
+}
+
+const cancelTransfer = async (taskId: string) => {
+  try {
+    await fileApi.cancelTransfer(taskId)
+  } catch (error) {
+    console.error('取消传输失败:', error)
+    message.error('取消传输失败')
+  }
+}
+
 const upload = async (local_paths: string[]) => {
   try {
+    const uploadPath = normalizeRemotePath(props.upload_path)
+    const configId = props.config_id
     const result: TransferProgress[] = await fileApi.uploadFile(
-        props.config_id,
-        props.upload_path,
+        configId,
+        uploadPath,
         local_paths
     );
+    const batchId = `${Date.now()}-${Math.random()}`
+    uploadBatches.set(batchId, {
+      configId,
+      uploadPath,
+      taskIds: new Set(result.map((item) => item.id)),
+      notified: false
+    })
+    result.forEach((item) => uploadTaskBatchMap.set(item.id, batchId))
     uploadItems.value.push(...result)
   } catch (error) {
     console.error('上传启动失败:', error);
@@ -168,6 +247,7 @@ onMounted(async () => {
     if (index >= 0) {
       uploadItems.value[index] = progress
       console.log(progress)
+      notifyCompletedUploadBatch(progress)
     }
     index = downloadItems.value.findIndex(item => item.id === progress.id)
     if (index >= 0) {
@@ -187,7 +267,7 @@ onMounted(async () => {
 
 watch(uploadAllCompleted, (val) => {
   if (val && !uploadNotified.value) {
-    message.success('文件上传已完成')
+    message.success('文件上传队列已结束')
     uploadNotified.value = true
   }
   if (!val) {
@@ -197,7 +277,7 @@ watch(uploadAllCompleted, (val) => {
 
 watch(downloadAllCompleted, (val) => {
   if (val && !downloadNotified.value) {
-    message.success('文件下载已完成')
+    message.success('文件下载队列已结束')
     downloadNotified.value = true
   }
   if (!val) {
@@ -354,6 +434,28 @@ defineExpose({
           &.failed {
             background: #fff2f0;
             color: #ff4d4f;
+          }
+
+          &.cancelled {
+            background: #f5f5f5;
+            color: #8c8c8c;
+          }
+        }
+
+        .cancel-button {
+          width: 22px;
+          height: 22px;
+          border: 1px solid #d9d9d9;
+          border-radius: 50%;
+          background: #fff;
+          color: #666;
+          cursor: pointer;
+          line-height: 18px;
+          padding: 0;
+
+          &:hover {
+            color: #ff4d4f;
+            border-color: #ff4d4f;
           }
         }
       }

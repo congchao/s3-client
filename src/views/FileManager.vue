@@ -14,7 +14,7 @@ import {open} from '@tauri-apps/plugin-dialog';
 import router from "@/router";
 import dayjs from "dayjs";
 import {hideLoading, showLoading} from '@/utils/loading.ts'
-import TransferIndicator from '@/views/components/TransferIndicator.vue'
+import TransferIndicator, {type UploadCompletedPayload} from '@/views/components/TransferIndicator.vue'
 import FilePreviewModal from '@/views/components/FilePreviewModal.vue';
 import ContextMenu from '@/views/components/ContextMenu.vue'; // 导入新组件
 import {configApi} from "@/services/config.ts";
@@ -39,7 +39,7 @@ const previewFile = ref<FileItem | null>(null)
 const transferRef = ref<InstanceType<typeof TransferIndicator> | null>(null)
 
 const currentPath = computed(() => {
-  return currentPathParts.value.join('/') + "/"
+  return currentPathParts.value.length > 0 ? `${currentPathParts.value.join('/')}/` : ''
 })
 const resetSearch = () => {
   searchValue.value = ''
@@ -172,6 +172,29 @@ const refreshFiles = async (): Promise<void> => {
   await loadFileList(false) // 重新加载第一页
 }
 
+const normalizeRemotePath = (path: string): string => {
+  const normalized = path.trim().replace(/^\/+|\/+$/g, '')
+  return normalized ? `${normalized}/` : ''
+}
+
+const getParentRemotePath = (path: string): string => {
+  const normalized = normalizeRemotePath(path).replace(/\/$/, '')
+  const lastSlashIndex = normalized.lastIndexOf('/')
+  return lastSlashIndex >= 0 ? `${normalized.slice(0, lastSlashIndex)}/` : ''
+}
+
+const handleUploadCompleted = async ({configId, uploadPath}: UploadCompletedPayload): Promise<void> => {
+  if (configId !== selectedConfig.value) return
+
+  const current = normalizeRemotePath(currentPath.value)
+  const uploaded = normalizeRemotePath(uploadPath)
+  const uploadedParent = getParentRemotePath(uploaded)
+
+  if (current === uploaded || current === uploadedParent) {
+    await refreshFiles()
+  }
+}
+
 // 搜索文件
 const onSearch = (e: KeyboardEvent) => {
   if (e.keyCode === 229 || isComposing.value) {
@@ -247,7 +270,9 @@ const deleteFile = async (file: FileItem): Promise<void> => {
 
 const copyFilePath = async (file: FileItem): Promise<void> => {
   try {
-    const fullPath = getCompletePath(file)
+    const keyPath = getCompletePath(file)
+    const bucket = configList.value.find(c => c.id === selectedConfig.value)?.bucket || ''
+    const fullPath = bucket ? `${bucket}/${keyPath}` : keyPath
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(fullPath)
     } else {
@@ -495,7 +520,12 @@ onUnmounted(() => {
         @download="downloadFile"
     />
     <!-- 进度条组件 -->
-    <TransferIndicator ref="transferRef" :config_id="selectedConfig" :upload_path="currentPath"/>
+    <TransferIndicator
+        ref="transferRef"
+        :config_id="selectedConfig"
+        :upload_path="currentPath"
+        @upload-completed="handleUploadCompleted"
+    />
   </div>
 </template>
 

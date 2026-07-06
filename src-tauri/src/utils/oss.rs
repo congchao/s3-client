@@ -5,11 +5,11 @@ use aws_sdk_s3::config::{Credentials, SharedCredentialsProvider};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::delete_object::*;
 use aws_sdk_s3::operation::get_object::*;
-use aws_sdk_s3::operation::list_buckets::*;
 use aws_sdk_s3::operation::list_objects_v2::*;
 use aws_sdk_s3::operation::put_object::*;
 // 添加预签名相关导入
 use aws_sdk_s3::presigning::PresigningConfig;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::ByteStream;
 
@@ -18,11 +18,17 @@ use crate::models::OssConfig;
 use aws_smithy_types::checksum_config::RequestChecksumCalculation;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
+
+static OSS_CLIENT_CACHE: LazyLock<Mutex<HashMap<String, Arc<Oss>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +50,11 @@ pub struct FileList {
 pub struct Oss {
     pub client: Client,
     pub config: OssConfig,
+}
+
+struct ObjectKeyPage {
+    objects: Vec<String>,
+    next_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,16 +102,33 @@ impl Oss {
         })
     }
 
-    pub fn new(id: &str) -> Result<Self, Box<dyn Error>> {
-        let cnf = APP_CONFIG.lock().unwrap();
+    pub fn new(id: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let cnf = APP_CONFIG.lock().map_err(|e| e.to_string())?;
         let oss_config = cnf.get(id).cloned()?;
         Ok(Self::new_with_config(&oss_config)?)
     }
 
-    pub async fn list_buckets(
-        &self,
-    ) -> Result<ListBucketsOutput, SdkError<ListBucketsError, HttpResponse>> {
-        self.client.list_buckets().send().await
+    pub fn new_cached(id: &str) -> Result<Arc<Self>, Box<dyn Error + Send + Sync>> {
+        {
+            let cache = OSS_CLIENT_CACHE.lock().map_err(|e| e.to_string())?;
+            if let Some(oss) = cache.get(id) {
+                return Ok(oss.clone());
+            }
+        }
+
+        let oss = Arc::new(Self::new(id)?);
+        let mut cache = OSS_CLIENT_CACHE.lock().map_err(|e| e.to_string())?;
+        if let Some(cached) = cache.get(id) {
+            return Ok(cached.clone());
+        }
+        cache.insert(id.to_string(), oss.clone());
+        Ok(oss)
+    }
+
+    pub fn clear_cached_config(id: &str) {
+        if let Ok(mut cache) = OSS_CLIENT_CACHE.lock() {
+            cache.remove(id);
+        }
     }
 
     pub async fn get_object(
@@ -124,17 +152,16 @@ impl Oss {
         &self,
         key: &str,
         path: &str,
-    ) -> Result<PutObjectOutput, SdkError<PutObjectError, HttpResponse>> {
-        // 创建字节流时添加更好的错误处理
+    ) -> Result<PutObjectOutput, Box<dyn Error + Send + Sync>> {
         let byte_stream = ByteStream::from_path(path)
             .await
-            .map_err(|e| println!("创建字节流失败: {}，路径: {}", e, path))
-            .unwrap();
-        let content_length = tokio::fs::metadata(path).await.unwrap().len() as i64;
+            .map_err(|e| format!("创建字节流失败: {}，路径: {}", e, path))?;
+        let content_length = tokio::fs::metadata(path).await?.len() as i64;
         // 根据文件路径推断 content-type
         let mime_type = mime_guess::from_path(path).first_or_octet_stream();
         let content_type = mime_type.essence_str().to_string();
-        self.client
+        Ok(self
+            .client
             .put_object()
             .bucket(&self.config.bucket)
             .key(key)
@@ -142,7 +169,7 @@ impl Oss {
             .content_type(content_type)
             .content_length(content_length)
             .send()
-            .await
+            .await?)
     }
 
     async fn _delete_object(
@@ -156,45 +183,58 @@ impl Oss {
             .send()
             .await
     }
+
+    fn chunk_delete_keys(keys: &[String]) -> Vec<Vec<String>> {
+        keys.chunks(1000).map(|chunk| chunk.to_vec()).collect()
+    }
+
+    async fn delete_objects_batch(
+        &self,
+        keys: &[String],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for chunk in Self::chunk_delete_keys(keys) {
+            let objects = chunk
+                .into_iter()
+                .map(|key| ObjectIdentifier::builder().key(key).build())
+                .collect::<Result<Vec<_>, _>>()?;
+
+            self.client
+                .delete_objects()
+                .bucket(&self.config.bucket)
+                .delete(Delete::builder().set_objects(Some(objects)).build()?)
+                .send()
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    fn normalize_directory_prefix(directory_path: &str) -> String {
+        let directory_path = directory_path.trim_matches('/');
+        if directory_path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", directory_path)
+        }
+    }
+
     async fn delete_directory_recursive(
         &self,
         directory_path: &str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let dir_prefix = if directory_path.ends_with('/') {
-            directory_path.to_string()
-        } else {
-            format!("{}/", directory_path)
-        };
-
-        // 获取目录下所有对象
-        let mut all_objects = Vec::new();
+        let dir_prefix = Self::normalize_directory_prefix(directory_path);
         let mut next_token: Option<String> = None;
 
         loop {
-            let file_list = self
-                .list_objects(Some(&dir_prefix), Some(1000), next_token.as_deref())
+            let page = self
+                .list_object_keys_page(&dir_prefix, next_token.as_deref())
                 .await?;
+            self.delete_objects_batch(&page.objects).await?;
 
-            for file_info in file_list.objects {
-                if !file_info.is_dir {
-                    let full_key = if dir_prefix.is_empty() {
-                        file_info.name.clone()
-                    } else {
-                        format!("{}{}", dir_prefix, file_info.name)
-                    };
-                    all_objects.push(full_key);
-                }
-            }
-
-            if file_list.next_token.is_none() {
+            if page.next_token.is_none() {
                 break;
             }
-            next_token = file_list.next_token;
-        }
-
-        // 批量删除所有对象
-        for object_key in all_objects {
-            self._delete_object(&object_key).await?;
+            next_token = page.next_token;
         }
 
         // 删除目录本身（如果存在作为对象的目录标记）
@@ -313,17 +353,20 @@ impl Oss {
         next_token: Option<&str>,
     ) -> Result<FileList, SdkError<ListObjectsV2Error, HttpResponse>> {
         let _max_keys = if let Some(v) = max_keys { v } else { 100 };
+        let prefix = prefix.unwrap_or("");
         let mut build = self
             .client
             .list_objects_v2()
             .bucket(&self.config.bucket)
             .delimiter("/")
             .max_keys(_max_keys);
-        if !prefix.is_none() && prefix.unwrap() != "" {
-            build = build.prefix(prefix.unwrap());
+        if !prefix.is_empty() {
+            build = build.prefix(prefix);
         }
-        if !next_token.is_none() && next_token.unwrap() != "" {
-            build = build.continuation_token(next_token.unwrap());
+        if let Some(next_token) = next_token {
+            if !next_token.is_empty() {
+                build = build.continuation_token(next_token);
+            }
         }
         let mut res = FileList {
             objects: vec![],
@@ -335,10 +378,7 @@ impl Oss {
         }
         for x in response.common_prefixes() {
             res.objects.push(FileInfo {
-                name: Self::remove_prefix(
-                    prefix.unwrap(),
-                    x.prefix().unwrap().strip_suffix("/").unwrap(),
-                ),
+                name: Self::remove_prefix(prefix, x.prefix().unwrap().strip_suffix("/").unwrap()),
                 last_modified: None,
                 size: None,
                 is_dir: true,
@@ -351,7 +391,7 @@ impl Oss {
                 .essence_str()
                 .to_string();
             res.objects.push(FileInfo {
-                name: Self::remove_prefix(prefix.unwrap(), x.key().unwrap()),
+                name: Self::remove_prefix(prefix, x.key().unwrap()),
                 last_modified: Option::from(x.last_modified.unwrap().to_string()),
                 size: x.size,
                 is_dir: false,
@@ -361,72 +401,56 @@ impl Oss {
         Ok(res)
     }
 
-    /**
-     * 递归目录列出指定prefix下的所有文件
-     * @param prefix 目录前缀
-     */
-    pub async fn list_all_objects(
+    pub async fn list_all_object_keys(
         &self,
-        prefix: &String,
-    ) -> Result<FileList, SdkError<ListObjectsV2Error, HttpResponse>> {
-        async fn list_all_objects_recursive(
-            client: &Client,
-            bucket: &str,
-            prefix: &str,
-            next_token: Option<&str>,
-        ) -> Result<FileList, SdkError<ListObjectsV2Error, HttpResponse>> {
-            let mut build = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix)
-                .max_keys(1000);
-            if !next_token.is_none() && next_token.unwrap() != "" {
-                build = build.continuation_token(next_token.unwrap());
-            }
-            let mut res = FileList {
-                objects: vec![],
-                next_token: None,
-            };
-            let response = build.send().await?;
-            if let Some(v) = response.next_continuation_token() {
-                res.next_token = Some(v.to_string());
-            }
-            for x in response.contents() {
-                let content_type = mime_guess::from_path(x.key().unwrap())
-                    .first_or_octet_stream()
-                    .essence_str()
-                    .to_string();
-                res.objects.push(FileInfo {
-                    name: x.key.clone().unwrap(),
-                    last_modified: Option::from(x.last_modified.unwrap().to_string()),
-                    size: x.size,
-                    is_dir: false,
-                    content_type: Option::from(content_type),
-                })
-            }
-            Ok(res)
-        }
-        let mut result = FileList {
-            objects: vec![],
-            next_token: None,
-        };
+        prefix: &str,
+    ) -> Result<Vec<String>, SdkError<ListObjectsV2Error, HttpResponse>> {
+        let mut result = Vec::new();
+        let mut next_token: Option<String> = None;
+
         loop {
-            let res = list_all_objects_recursive(
-                &self.client,
-                &self.config.bucket,
-                prefix,
-                result.next_token.clone().as_deref(),
-            )
-            .await?;
-            result.next_token = res.next_token.clone();
-            for object in res.objects {
-                result.objects.push(object);
-            }
-            if result.next_token.is_none() {
+            let page = self
+                .list_object_keys_page(prefix, next_token.as_deref())
+                .await?;
+            result.extend(page.objects);
+
+            if page.next_token.is_none() {
                 break;
             }
+            next_token = page.next_token;
         }
+
         Ok(result)
+    }
+
+    async fn list_object_keys_page(
+        &self,
+        prefix: &str,
+        next_token: Option<&str>,
+    ) -> Result<ObjectKeyPage, SdkError<ListObjectsV2Error, HttpResponse>> {
+        let mut build = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.config.bucket)
+            .prefix(prefix)
+            .max_keys(1000);
+        if let Some(next_token) = next_token {
+            if !next_token.is_empty() {
+                build = build.continuation_token(next_token);
+            }
+        }
+
+        let response = build.send().await?;
+        let objects = response
+            .contents()
+            .iter()
+            .filter_map(|object| object.key().map(|key| key.to_string()))
+            .collect();
+
+        Ok(ObjectKeyPage {
+            objects,
+            next_token: response.next_continuation_token().map(|v| v.to_string()),
+        })
     }
 
     /**
@@ -440,7 +464,12 @@ impl Oss {
         key: &str,
         file_path: &str,
         progress_callback: Option<Box<dyn Fn(u64, u64) + Send>>,
+        cancellation_token: CancellationToken,
     ) -> Result<(), String> {
+        if cancellation_token.is_cancelled() {
+            return Err("任务已取消".to_string());
+        }
+
         // 获取文件元数据
         let metadata = tokio::fs::metadata(file_path)
             .await
@@ -452,15 +481,25 @@ impl Oss {
         if progress_callback.is_some() && total_size > 5 * 1024 * 1024 {
             // 5MB 以上使用分片上传
             return self
-                .upload_file_multipart(key, file_path, total_size, progress_callback.unwrap())
+                .upload_file_multipart(
+                    key,
+                    file_path,
+                    total_size,
+                    progress_callback.unwrap(),
+                    cancellation_token,
+                )
                 .await
                 .map_err(|e| return format!("分段上传失败: {}", e));
+        }
+
+        if cancellation_token.is_cancelled() {
+            return Err("任务已取消".to_string());
         }
 
         let _res = self
             .put_object(key, file_path)
             .await
-            .map_err(|e| format!("文件上传失败: {}", e));
+            .map_err(|e| format!("文件上传失败: {}", e))?;
         // 调用最终进度回调
         if let Some(callback) = progress_callback {
             callback(total_size, total_size);
@@ -474,6 +513,7 @@ impl Oss {
         file_path: &str,
         total_size: u64,
         progress_callback: Box<dyn Fn(u64, u64) + Send + 'static>,
+        cancellation_token: CancellationToken,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 开始分片上传
         let create_multipart_upload_output = self
@@ -484,7 +524,9 @@ impl Oss {
             .send()
             .await?;
 
-        let upload_id = create_multipart_upload_output.upload_id().unwrap();
+        let upload_id = create_multipart_upload_output
+            .upload_id()
+            .ok_or("分段上传未返回 upload_id")?;
 
         let mut part_number = 1;
         let mut uploaded_bytes = 0u64;
@@ -496,6 +538,18 @@ impl Oss {
         let mut file = AsyncFile::open(file_path).await?;
 
         loop {
+            if cancellation_token.is_cancelled() {
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.config.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+                return Err("任务已取消".into());
+            }
+
             // 读取一块数据
             let mut buffer = vec![0; chunk_size];
             let mut bytes_read = 0;
@@ -511,6 +565,17 @@ impl Oss {
             }
             if bytes_read == 0 {
                 break; // 文件读取完毕
+            }
+            if cancellation_token.is_cancelled() {
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.config.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+                return Err("任务已取消".into());
             }
             // 调整缓冲区大小
             buffer.truncate(bytes_read);
@@ -528,7 +593,7 @@ impl Oss {
             let etag = upload_part_output
                 .e_tag()
                 .map(|t| t.trim_matches('"').to_string())
-                .unwrap();
+                .ok_or("上传分片未返回 ETag")?;
             completed_parts.push(
                 aws_sdk_s3::types::CompletedPart::builder()
                     .part_number(part_number)
@@ -562,13 +627,22 @@ impl Oss {
         match output {
             Ok(_) => {}
             Err(e) => {
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.config.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
                 if let Some(service_error) = e.as_service_error() {
                     // 这里会打印具体错误，比如：Code: EntityTooSmall
-                    eprintln!("MinIO 错误代码: {:?}", service_error.code().unwrap());
-                    eprintln!("错误详情: {:?}", service_error.message().unwrap());
+                    eprintln!("MinIO 错误代码: {:?}", service_error.code());
+                    eprintln!("错误详情: {:?}", service_error.message());
                 } else {
                     eprintln!("其他错误: {:?}", e);
                 }
+                return Err(format!("完成分段上传失败: {}", e).into());
             }
         }
         Ok(())
@@ -585,7 +659,12 @@ impl Oss {
         key: &str,
         file_path: &str,
         progress_callback: Box<dyn Fn(u64, u64) + Send>,
+        cancellation_token: CancellationToken,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if cancellation_token.is_cancelled() {
+            return Err("任务已取消".into());
+        }
+
         // 确保本地目录存在
         tokio::fs::create_dir_all(Path::new(file_path).parent().unwrap())
             .await
@@ -601,14 +680,20 @@ impl Oss {
             .map_err(|e| format!("创建本地文件失败: {}", e))?;
 
         // 获取远程文件信息
-        let result = self.get_object(key).await.unwrap();
+        let result = self.get_object(key).await?;
         // 获取文件大小
         let file_size = result.content_length().unwrap_or(0) as u64;
 
         // 设置分片大小（2MB）
         let chunk_size: u64 = 2 * 1024 * 1024;
         if file_size <= chunk_size {
-            let byte_result = result.body.collect().await.unwrap().to_vec();
+            if cancellation_token.is_cancelled() {
+                return Err("任务已取消".into());
+            }
+            let byte_result = result.body.collect().await?.to_vec();
+            if cancellation_token.is_cancelled() {
+                return Err("任务已取消".into());
+            }
             // 对于小文件，直接下载
             file.write_all(&byte_result).await?;
             file.flush().await?;
@@ -619,6 +704,9 @@ impl Oss {
             let mut downloaded_bytes = 0u64;
 
             while downloaded_bytes < file_size {
+                if cancellation_token.is_cancelled() {
+                    return Err("任务已取消".into());
+                }
                 let end_byte = std::cmp::min(downloaded_bytes + chunk_size - 1, file_size - 1);
                 let range_header = format!("bytes={}-{}", downloaded_bytes, end_byte);
 
@@ -641,6 +729,10 @@ impl Oss {
 
                 let chunk_data = body.into_bytes();
 
+                if cancellation_token.is_cancelled() {
+                    return Err("任务已取消".into());
+                }
+
                 // 写入本地文件
                 file.write_all(&chunk_data)
                     .await
@@ -658,5 +750,32 @@ impl Oss {
                 .map_err(|e| format!("刷新文件缓存失败: {}", e))?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Oss;
+
+    #[test]
+    fn normalizes_directory_prefix_for_recursive_delete() {
+        assert_eq!(Oss::normalize_directory_prefix("dir"), "dir/");
+        assert_eq!(Oss::normalize_directory_prefix("dir/"), "dir/");
+        assert_eq!(Oss::normalize_directory_prefix("/dir/sub/"), "dir/sub/");
+        assert_eq!(Oss::normalize_directory_prefix(""), "");
+        assert_eq!(Oss::normalize_directory_prefix("/"), "");
+    }
+
+    #[test]
+    fn chunks_delete_keys_by_s3_limit() {
+        let keys = (0..2501)
+            .map(|index| format!("file-{}.txt", index))
+            .collect::<Vec<_>>();
+        let chunks = Oss::chunk_delete_keys(&keys);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 1000);
+        assert_eq!(chunks[1].len(), 1000);
+        assert_eq!(chunks[2].len(), 501);
     }
 }

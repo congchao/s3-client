@@ -78,6 +78,11 @@ const editConfig = (record: OssConfig): void => {
   router.push({name: 'EditConfig', params: {id: record.id}})
 }
 
+// 复制配置
+const copyConfig = (record: OssConfig): void => {
+  router.push({name: 'NewConfig', query: {copyId: record.id}})
+}
+
 // 删除配置
 const del = async (record: OssConfig): Promise<void> => {
   const configToDelete = configList.value.find(config => config.id === record.id)
@@ -189,7 +194,7 @@ onMounted(async () => {
               <a-space wrap>
                 <a-button type="link" size="small" @click="editConfig(record)">编辑</a-button>
                 <a-button type="link" size="small" @click="testSingleConfig(record)">测试</a-button>
-                <a-button type="link" size="small" @click="enterFileManager(record)">管理</a-button>
+                <a-button type="link" size="small" @click="copyConfig(record)">复制</a-button>
                 <a-button type="link" danger size="small" @click="del(record)">删除</a-button>
               </a-space>
             </template>

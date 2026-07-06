@@ -42,7 +42,7 @@ const basicRules = reactive({
 })
 
 // 获取当前是编辑还是新增
-const isEdit = ref<boolean>(!!route.params.name)
+const isEdit = ref<boolean>(!!route.params.id)
 
 // 返回上一页
 const goBack = (): void => {
@@ -79,7 +79,7 @@ const testConnection = async (): Promise<void> => {
 
     // 构建配置对象用于测试
     const config: OssConfig = {
-      id: route.params.name as string,
+      id: basicForm.id || crypto.randomUUID(),
       name: basicForm.name || 'test-connection',
       provider: basicForm.provider,
       region: basicForm.region,
@@ -112,7 +112,7 @@ const save = async (): Promise<void> => {
 
     // 直接传递驼峰式命名的配置给后端
     const config: OssConfig = {
-      id: route.params.id as string || crypto.randomUUID(),
+      id: route.params.id as string || basicForm.id || crypto.randomUUID(),
       name: basicForm.name,
       provider: basicForm.provider,
       region: basicForm.region,
@@ -137,6 +137,7 @@ const save = async (): Promise<void> => {
 
 // 初始化编辑模式数据
 onMounted(async () => {
+  const copyId = route.query.copyId as string | undefined
   if (route.params.id) {
     // 编辑模式，获取现有配置
     try {
@@ -159,6 +160,32 @@ onMounted(async () => {
     } catch (error) {
       console.error('获取配置失败:', error)
       message.error('获取配置失败！')
+    }
+  } else if (copyId) {
+    try {
+      const configs: OssConfig[] = await configApi.getConfig()
+      const config = configs.find(c => c.id === copyId) as OssConfig
+
+      if (config) {
+        Object.assign(basicForm, {
+          id: crypto.randomUUID(),
+          name: `${config.name}-复制`,
+          provider: config.provider,
+          region: config.region,
+          accessKey: config.accessKey,
+          secretKey: config.secretKey,
+          endpoint: config.endpoint,
+          bucket: config.bucket,
+          pathStyle: config.pathStyle || 'path',
+        })
+      } else {
+        message.error('未找到要复制的配置')
+        basicForm.id = crypto.randomUUID()
+      }
+    } catch (error) {
+      console.error('复制配置失败:', error)
+      message.error('复制配置失败！')
+      basicForm.id = crypto.randomUUID()
     }
   } else {
     // 新增模式，生成新ID

@@ -32,6 +32,7 @@ pub fn run() {
             commands::file_get_preview_url,
             commands::file_upload,
             commands::file_download_path,
+            commands::file_transfer_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
