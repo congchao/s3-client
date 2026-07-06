@@ -1,5 +1,5 @@
 use crate::models::{TransferProgress, TransferStatus};
-use crate::utils::{FileList, Oss};
+use crate::utils::{BucketInfo, FileList, Oss};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -13,7 +13,7 @@ use uuid::Uuid;
 // 限制最大并发数为 5
 const MAX_CONCURRENT: usize = 5;
 const TRANSFER_QUEUE_CAPACITY: usize = 1000;
-const PREVIEW_DOWNLOAD_MAX_SIZE: i64 = 5 * 1024 * 1024;
+const PREVIEW_DOWNLOAD_MAX_SIZE: i64 = 10 * 1024 * 1024;
 
 struct TransferJob {
     task: TransferProgress,
@@ -123,6 +123,7 @@ async fn perform_upload(
 
     let result = oss
         .upload_file(
+            &task.bucket,
             &task.to_path,
             &task.from_path,
             Some(Box::new(move |total, current| {
@@ -175,6 +176,7 @@ async fn perform_download(
 
     let result = oss
         .download_file(
+            &task.bucket,
             &task.from_path,
             &task.to_path,
             Box::new(move |total, current| {
@@ -297,19 +299,23 @@ fn safe_local_destination(
 #[tauri::command]
 pub async fn file_list(
     id: String,
+    bucket: String,
     path: Option<String>,
     next_token: Option<String>,
 ) -> Result<FileList, String> {
     let oss = Oss::new_cached(&id).map_err(|e| format!("OSS init failed: {}", e))?;
-    oss.list_objects(path.as_deref(), Some(1000), next_token.as_deref())
+    oss.list_objects(&bucket, path.as_deref(), Some(1000), next_token.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn file_download(id: String, path: String) -> Result<Vec<u8>, String> {
+pub async fn file_download(id: String, bucket: String, path: String) -> Result<Vec<u8>, String> {
     let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
-    let response = oss.get_object(&path).await.map_err(|e| e.to_string())?;
+    let response = oss
+        .get_object(&bucket, &path)
+        .await
+        .map_err(|e| e.to_string())?;
     if response.content_length().unwrap_or(0) > PREVIEW_DOWNLOAD_MAX_SIZE {
         return Err("文件过大，请使用下载功能保存到本地".to_string());
     }
@@ -318,22 +324,35 @@ pub async fn file_download(id: String, path: String) -> Result<Vec<u8>, String> 
 }
 
 #[tauri::command]
-pub async fn file_delete(id: String, key: String) -> Result<(), String> {
+pub async fn file_delete(id: String, bucket: String, key: String) -> Result<(), String> {
     let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
-    oss.delete_object(&key).await.map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn file_get_preview_url(id: String, key: String) -> Result<String, String> {
-    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
-    oss.get_presigned_url(&key, Duration::from_secs(3600))
+    oss.delete_object(&bucket, &key)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
+pub async fn file_get_preview_url(
+    id: String,
+    bucket: String,
+    key: String,
+) -> Result<String, String> {
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
+    oss.get_presigned_url(&bucket, &key, Duration::from_secs(3600))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn bucket_list(id: String) -> Result<Vec<BucketInfo>, String> {
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
+    oss.list_buckets().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn file_upload(
     id: String,
+    bucket: String,
     remote_path: String,
     local_path: Vec<String>,
     app_handle: AppHandle,
@@ -368,6 +387,7 @@ pub async fn file_upload(
         let task = TransferProgress {
             id: Uuid::new_v4().to_string(),
             config_id: id.clone(),
+            bucket: bucket.clone(),
             name: file_name.to_string(),
             from_path: full_path.clone(),
             to_path: final_key,
@@ -405,6 +425,7 @@ pub async fn file_upload(
 #[tauri::command]
 pub async fn file_download_path(
     id: String,
+    bucket: String,
     remote_keys: Vec<String>,
     local_path: String,
     app_handle: AppHandle,
@@ -423,15 +444,22 @@ pub async fn file_download_path(
         if remote_key.ends_with('/') {
             // 是目录，递归列出（这里保留递归查找，但建议后端OSS有前缀搜索能力）
             let all_keys = oss
-                .list_all_object_keys(&remote_key)
+                .list_all_object_keys(&bucket, &remote_key)
                 .await
                 .map_err(|e| e.to_string())?;
             for key in all_keys {
-                tasks.push(create_download_task(&id, &key, &remote_basic, &local_path)?);
+                tasks.push(create_download_task(
+                    &id,
+                    &bucket,
+                    &key,
+                    &remote_basic,
+                    &local_path,
+                )?);
             }
         } else {
             tasks.push(create_download_task(
                 &id,
+                &bucket,
                 &remote_key,
                 &remote_basic,
                 &local_path,
@@ -479,6 +507,7 @@ pub async fn file_transfer_cancel(task_id: String) -> Result<(), String> {
 
 fn create_download_task(
     id: &str,
+    bucket: &str,
     key: &str,
     base_remote: &str,
     local_root: &str,
@@ -488,6 +517,7 @@ fn create_download_task(
     Ok(TransferProgress {
         id: Uuid::new_v4().to_string(),
         config_id: id.to_string(),
+        bucket: bucket.to_string(),
         name: Path::new(key)
             .file_name()
             .unwrap_or_default()

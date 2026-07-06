@@ -21,7 +21,13 @@ const routes: Array<RouteRecordRaw> = [
         props: true
     },
     {
-        path: '/file/:id',
+        path: '/bucket/:id',
+        name: 'BucketList',
+        component: () => import('@/views/BucketList.vue'),
+        props: true
+    },
+    {
+        path: '/file/:id/:bucket',
         name: 'FileManager',
         component: () => import('@/views/FileManager.vue'),
         props: true

@@ -77,17 +77,20 @@ import {message} from "ant-design-vue";
 
 export interface UploadCompletedPayload {
   configId: string
+  bucket: string
   uploadPath: string
 }
 
 // 定义 props
 interface Props {
   config_id: string,
+  bucket: string,
   upload_path: string
 }
 
 const props = withDefaults(defineProps<Props>(), {
   config_id: "",
+  bucket: "",
   upload_path: "",
 })
 const emit = defineEmits<{
@@ -106,6 +109,7 @@ let dragDropEvent: UnlistenFn | null = null
 
 interface UploadBatch {
   configId: string
+  bucket: string
   uploadPath: string
   taskIds: Set<string>
   notified: boolean
@@ -135,6 +139,7 @@ const notifyCompletedUploadBatch = (progress: TransferProgress): void => {
     batch.notified = true
     emit('upload-completed', {
       configId: batch.configId,
+      bucket: batch.bucket,
       uploadPath: batch.uploadPath
     })
   }
@@ -202,14 +207,17 @@ const upload = async (local_paths: string[]) => {
   try {
     const uploadPath = normalizeRemotePath(props.upload_path)
     const configId = props.config_id
+    const bucket = props.bucket
     const result: TransferProgress[] = await fileApi.uploadFile(
         configId,
+        bucket,
         uploadPath,
         local_paths
     );
     const batchId = `${Date.now()}-${Math.random()}`
     uploadBatches.set(batchId, {
       configId,
+      bucket,
       uploadPath,
       taskIds: new Set(result.map((item) => item.id)),
       notified: false
@@ -227,6 +235,7 @@ const download = async (remoteKeys: string[], localPath: string) => {
     console.log(remoteKeys,localPath)
     const result: TransferProgress[] = await fileApi.downloadFilePath(
         props.config_id,
+        props.bucket,
         remoteKeys,
         localPath
     );

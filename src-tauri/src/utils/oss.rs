@@ -47,9 +47,15 @@ pub struct FileList {
     pub objects: Vec<FileInfo>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BucketInfo {
+    pub name: String,
+    pub creation_date: Option<String>,
+}
+
 pub struct Oss {
     pub client: Client,
-    pub config: OssConfig,
 }
 
 struct ObjectKeyPage {
@@ -98,7 +104,6 @@ impl Oss {
 
         Ok(Self {
             client: Client::from_conf(aws_config),
-            config: oss_config.clone(),
         })
     }
 
@@ -133,11 +138,12 @@ impl Oss {
 
     pub async fn get_object(
         &self,
+        bucket: &str,
         key: &str,
     ) -> Result<GetObjectOutput, SdkError<GetObjectError, HttpResponse>> {
         self.client
             .get_object()
-            .bucket(&self.config.bucket)
+            .bucket(bucket)
             .key(key)
             .send()
             .await
@@ -150,6 +156,7 @@ impl Oss {
      */
     pub async fn put_object(
         &self,
+        bucket: &str,
         key: &str,
         path: &str,
     ) -> Result<PutObjectOutput, Box<dyn Error + Send + Sync>> {
@@ -163,7 +170,7 @@ impl Oss {
         Ok(self
             .client
             .put_object()
-            .bucket(&self.config.bucket)
+            .bucket(bucket)
             .key(key)
             .body(byte_stream)
             .content_type(content_type)
@@ -174,11 +181,12 @@ impl Oss {
 
     async fn _delete_object(
         &self,
+        bucket: &str,
         key: &str,
     ) -> Result<DeleteObjectOutput, SdkError<DeleteObjectError, HttpResponse>> {
         self.client
             .delete_object()
-            .bucket(&self.config.bucket)
+            .bucket(bucket)
             .key(key)
             .send()
             .await
@@ -190,6 +198,7 @@ impl Oss {
 
     async fn delete_objects_batch(
         &self,
+        bucket: &str,
         keys: &[String],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         for chunk in Self::chunk_delete_keys(keys) {
@@ -200,7 +209,7 @@ impl Oss {
 
             self.client
                 .delete_objects()
-                .bucket(&self.config.bucket)
+                .bucket(bucket)
                 .delete(Delete::builder().set_objects(Some(objects)).build()?)
                 .send()
                 .await?;
@@ -220,6 +229,7 @@ impl Oss {
 
     async fn delete_directory_recursive(
         &self,
+        bucket: &str,
         directory_path: &str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let dir_prefix = Self::normalize_directory_prefix(directory_path);
@@ -227,9 +237,9 @@ impl Oss {
 
         loop {
             let page = self
-                .list_object_keys_page(&dir_prefix, next_token.as_deref())
+                .list_object_keys_page(bucket, &dir_prefix, next_token.as_deref())
                 .await?;
-            self.delete_objects_batch(&page.objects).await?;
+            self.delete_objects_batch(bucket, &page.objects).await?;
 
             if page.next_token.is_none() {
                 break;
@@ -239,17 +249,18 @@ impl Oss {
 
         // 删除目录本身（如果存在作为对象的目录标记）
         if !dir_prefix.is_empty() {
-            let _ = self._delete_object(&dir_prefix).await; // 忽略目录标记不存在的错误
+            let _ = self._delete_object(bucket, &dir_prefix).await; // 忽略目录标记不存在的错误
         }
 
         Ok(())
     }
     pub async fn get_object_type(
         &self,
+        bucket: &str,
         key: &str,
     ) -> Result<ObjectType, Box<dyn Error + Send + Sync>> {
         // 首先尝试获取对象信息
-        let result = self.get_object(key).await;
+        let result = self.get_object(bucket, key).await;
 
         if result.is_ok() {
             // 如果能直接获取到对象，说明这是个普通对象
@@ -263,7 +274,9 @@ impl Oss {
             format!("{}/", key)
         };
 
-        let dir_result = self.list_objects(Some(&dir_key), Some(1), None).await;
+        let dir_result = self
+            .list_objects(bucket, Some(&dir_key), Some(1), None)
+            .await;
         if let Ok(dir_list) = dir_result {
             if !dir_list.objects.is_empty() {
                 return Ok(ObjectType::Directory);
@@ -272,7 +285,9 @@ impl Oss {
 
         // 检查原 key 加上 / 后是否是目录
         let alt_dir_key = format!("{}/", key);
-        let alt_dir_result = self.list_objects(Some(&alt_dir_key), Some(1), None).await;
+        let alt_dir_result = self
+            .list_objects(bucket, Some(&alt_dir_key), Some(1), None)
+            .await;
         if let Ok(dir_list) = alt_dir_result {
             if !dir_list.objects.is_empty() {
                 return Ok(ObjectType::Directory);
@@ -282,23 +297,27 @@ impl Oss {
         Ok(ObjectType::NotFound)
     }
 
-    pub async fn delete_object(&self, key: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        match self.get_object_type(key).await? {
+    pub async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        match self.get_object_type(bucket, key).await? {
             ObjectType::Directory => {
-                self.delete_directory_recursive(key).await?;
+                self.delete_directory_recursive(bucket, key).await?;
             }
             ObjectType::Object => {
-                self._delete_object(key).await?;
+                self._delete_object(bucket, key).await?;
             }
             ObjectType::NotFound => {
                 // 尝试删除两种形式，以防万一
-                let _ = self._delete_object(key).await?;
+                let _ = self._delete_object(bucket, key).await?;
                 let dir_key = if key.ends_with('/') {
                     key.to_string()
                 } else {
                     format!("{}/", key)
                 };
-                let _ = self._delete_object(&dir_key).await?;
+                let _ = self._delete_object(bucket, &dir_key).await?;
             }
         }
 
@@ -324,6 +343,7 @@ impl Oss {
      */
     pub async fn get_presigned_url(
         &self,
+        bucket: &str,
         key: &str,
         expires_in: Duration,
     ) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -332,7 +352,7 @@ impl Oss {
         let presigned_request = self
             .client
             .get_object()
-            .bucket(&self.config.bucket)
+            .bucket(bucket)
             .key(key)
             .presigned(presigning_config)
             .await?;
@@ -348,6 +368,7 @@ impl Oss {
      */
     pub async fn list_objects(
         &self,
+        bucket: &str,
         prefix: Option<&str>,
         max_keys: Option<i32>,
         next_token: Option<&str>,
@@ -357,7 +378,7 @@ impl Oss {
         let mut build = self
             .client
             .list_objects_v2()
-            .bucket(&self.config.bucket)
+            .bucket(bucket)
             .delimiter("/")
             .max_keys(_max_keys);
         if !prefix.is_empty() {
@@ -403,6 +424,7 @@ impl Oss {
 
     pub async fn list_all_object_keys(
         &self,
+        bucket: &str,
         prefix: &str,
     ) -> Result<Vec<String>, SdkError<ListObjectsV2Error, HttpResponse>> {
         let mut result = Vec::new();
@@ -410,7 +432,7 @@ impl Oss {
 
         loop {
             let page = self
-                .list_object_keys_page(prefix, next_token.as_deref())
+                .list_object_keys_page(bucket, prefix, next_token.as_deref())
                 .await?;
             result.extend(page.objects);
 
@@ -425,13 +447,14 @@ impl Oss {
 
     async fn list_object_keys_page(
         &self,
+        bucket: &str,
         prefix: &str,
         next_token: Option<&str>,
     ) -> Result<ObjectKeyPage, SdkError<ListObjectsV2Error, HttpResponse>> {
         let mut build = self
             .client
             .list_objects_v2()
-            .bucket(&self.config.bucket)
+            .bucket(bucket)
             .prefix(prefix)
             .max_keys(1000);
         if let Some(next_token) = next_token {
@@ -453,6 +476,22 @@ impl Oss {
         })
     }
 
+    pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Box<dyn Error + Send + Sync>> {
+        let response = self.client.list_buckets().send().await?;
+        let buckets = response
+            .buckets()
+            .iter()
+            .filter_map(|bucket| {
+                bucket.name().map(|name| BucketInfo {
+                    name: name.to_string(),
+                    creation_date: bucket.creation_date().map(|date| date.to_string()),
+                })
+            })
+            .collect();
+
+        Ok(buckets)
+    }
+
     /**
      * 上传文件
      * @param key 文件存储key
@@ -461,6 +500,7 @@ impl Oss {
      */
     pub async fn upload_file(
         &self,
+        bucket: &str,
         key: &str,
         file_path: &str,
         progress_callback: Option<Box<dyn Fn(u64, u64) + Send>>,
@@ -482,6 +522,7 @@ impl Oss {
             // 5MB 以上使用分片上传
             return self
                 .upload_file_multipart(
+                    bucket,
                     key,
                     file_path,
                     total_size,
@@ -497,7 +538,7 @@ impl Oss {
         }
 
         let _res = self
-            .put_object(key, file_path)
+            .put_object(bucket, key, file_path)
             .await
             .map_err(|e| format!("文件上传失败: {}", e))?;
         // 调用最终进度回调
@@ -509,6 +550,7 @@ impl Oss {
 
     async fn upload_file_multipart(
         &self,
+        bucket: &str,
         key: &str,
         file_path: &str,
         total_size: u64,
@@ -519,7 +561,7 @@ impl Oss {
         let create_multipart_upload_output = self
             .client
             .create_multipart_upload()
-            .bucket(&self.config.bucket)
+            .bucket(bucket)
             .key(key)
             .send()
             .await?;
@@ -542,7 +584,7 @@ impl Oss {
                 let _ = self
                     .client
                     .abort_multipart_upload()
-                    .bucket(&self.config.bucket)
+                    .bucket(bucket)
                     .key(key)
                     .upload_id(upload_id)
                     .send()
@@ -570,7 +612,7 @@ impl Oss {
                 let _ = self
                     .client
                     .abort_multipart_upload()
-                    .bucket(&self.config.bucket)
+                    .bucket(bucket)
                     .key(key)
                     .upload_id(upload_id)
                     .send()
@@ -583,7 +625,7 @@ impl Oss {
             let upload_part_output = self
                 .client
                 .upload_part()
-                .bucket(&self.config.bucket)
+                .bucket(bucket)
                 .key(key)
                 .part_number(part_number)
                 .upload_id(upload_id)
@@ -618,7 +660,7 @@ impl Oss {
         let output = self
             .client
             .complete_multipart_upload()
-            .bucket(&self.config.bucket)
+            .bucket(bucket)
             .key(key)
             .upload_id(upload_id)
             .multipart_upload(completed_multipart_upload)
@@ -630,7 +672,7 @@ impl Oss {
                 let _ = self
                     .client
                     .abort_multipart_upload()
-                    .bucket(&self.config.bucket)
+                    .bucket(bucket)
                     .key(key)
                     .upload_id(upload_id)
                     .send()
@@ -656,6 +698,7 @@ impl Oss {
      */
     pub async fn download_file(
         &self,
+        bucket: &str,
         key: &str,
         file_path: &str,
         progress_callback: Box<dyn Fn(u64, u64) + Send>,
@@ -680,7 +723,7 @@ impl Oss {
             .map_err(|e| format!("创建本地文件失败: {}", e))?;
 
         // 获取远程文件信息
-        let result = self.get_object(key).await?;
+        let result = self.get_object(bucket, key).await?;
         // 获取文件大小
         let file_size = result.content_length().unwrap_or(0) as u64;
 
@@ -714,7 +757,7 @@ impl Oss {
                 let response = self
                     .client
                     .get_object()
-                    .bucket(&self.config.bucket)
+                    .bucket(bucket)
                     .key(key)
                     .range(range_header)
                     .send()

@@ -30,10 +30,10 @@ const tableColumns = [
     dataIndex: 'endpoint',
     key: 'endpoint',
     ellipsis: true,
-    width: 200,
+    width: 300,
   },
   {
-    title: '存储桶',
+    title: '默认桶',
     dataIndex: 'bucket',
     key: 'bucket',
     width: 150,
@@ -144,9 +144,10 @@ const testSingleConfig = async (record: OssConfig): Promise<void> => {
 
 // 在操作按钮中添加进入文件管理的按钮
 const enterFileManager = (record: OssConfig): void => {
+  const bucket = record.bucket?.trim()
   router.push({
-    name: 'FileManager',
-    params: {id: record.id}
+    name: bucket ? 'FileManager' : 'BucketList',
+    params: bucket ? {id: record.id, bucket} : {id: record.id}
   })
 }
 
@@ -176,7 +177,7 @@ onMounted(async () => {
             :pagination="false"
             :columns="tableColumns"
             row-key="id"
-            :loading="loading"            style="width: 100%;"
+            :loading="loading" style="width: 100%;"
             size="middle"
             :scroll="{ y: 'calc(100vh - 165px)' }"
             :customRow="(record:OssConfig) => ({
@@ -189,6 +190,9 @@ onMounted(async () => {
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'provider'">
               <a-tag>{{ record.provider }}</a-tag>
+            </template>
+            <template v-else-if="column.key === 'bucket'">
+              {{ record.bucket || '未设置' }}
             </template>
             <template v-else-if="column.key === 'operation'">
               <a-space wrap>
@@ -204,6 +208,8 @@ onMounted(async () => {
     </a-layout-content>
   </div>
 </template>
-<style scoped lang="less">
-
+<style lang="less">
+.ant-table-row {
+  cursor: pointer;
+}
 </style>

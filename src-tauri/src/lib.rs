@@ -26,6 +26,7 @@ pub fn run() {
             commands::config_get,
             commands::config_delete,
             commands::config_test,
+            commands::bucket_list,
             commands::file_list,
             commands::file_download,
             commands::file_delete,

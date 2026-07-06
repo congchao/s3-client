@@ -38,7 +38,6 @@ const basicRules = reactive({
     {required: true, message: '请输入端点URL', trigger: 'blur'},
     {type: 'url', message: '请输入合法的URL', trigger: 'blur'},
   ],
-  bucket: [{required: true, message: '请输入存储桶名称', trigger: 'blur'}],
 })
 
 // 获取当前是编辑还是新增
@@ -86,7 +85,7 @@ const testConnection = async (): Promise<void> => {
       accessKey: basicForm.accessKey,
       secretKey: basicForm.secretKey,
       endpoint: basicForm.endpoint,
-      bucket: basicForm.bucket,
+      bucket: basicForm.bucket.trim(),
       pathStyle: basicForm.pathStyle,
     }
 
@@ -119,7 +118,7 @@ const save = async (): Promise<void> => {
       accessKey: basicForm.accessKey,
       secretKey: basicForm.secretKey,
       endpoint: basicForm.endpoint,
-      bucket: basicForm.bucket,
+      bucket: basicForm.bucket.trim(),
       pathStyle: basicForm.pathStyle,
     }
 
@@ -248,8 +247,8 @@ onMounted(async () => {
           <a-form-item label="端点URL" name="endpoint">
             <a-input v-model:value="basicForm.endpoint" placeholder="请输入S3兼容端点URL"/>
           </a-form-item>
-          <a-form-item label="存储桶名称" name="bucket">
-            <a-input v-model:value="basicForm.bucket" placeholder="请输入存储桶名称"/>
+          <a-form-item label="默认存储桶" name="bucket">
+            <a-input v-model:value="basicForm.bucket" placeholder="可选；不填则进入后展示账号下所有桶"/>
           </a-form-item>
           <a-form-item label="路径访问样式" name="pathStyle">
             <a-radio-group v-model:value="basicForm.pathStyle">
@@ -257,7 +256,7 @@ onMounted(async () => {
               <a-radio value="virtual">虚拟托管</a-radio>
             </a-radio-group>
           </a-form-item>
-          <a-form-item>
+          <a-form-item style="position: absolute;bottom: 28px;right: 12px;margin: 0;">
             <a-flex align="center" justify="center" gap="middle">
               <a-button type="primary" @click="save" :icon="h(CheckOutlined)">保存配置</a-button>
               <a-button @click="testConnection" :loading="testing" :icon="h(SyncOutlined)">测试连接</a-button>

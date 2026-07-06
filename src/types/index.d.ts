@@ -24,9 +24,15 @@ export interface FileList {
     objects: FileItem[]
 }
 
+export interface BucketInfo {
+    name: string
+    creationDate: string | null
+}
+
 export interface TransferProgress {
     id: string
     config_id: string
+    bucket: string
     name: string
     from_path: string
     to_path: string

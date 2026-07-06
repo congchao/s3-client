@@ -16,6 +16,7 @@ pub enum TransferStatus {
 pub struct TransferProgress {
     pub id: String,
     pub config_id: String,
+    pub bucket: String,
     pub name: String,
     pub from_path: String,
     pub to_path: String,

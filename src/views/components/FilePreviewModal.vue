@@ -15,6 +15,7 @@ interface Props {
   visible: boolean;
   file: FileItem | null;
   configId: string;
+  bucket: string;
   currentPath: string;
 }
 
@@ -98,6 +99,7 @@ const previewFileContent = async (): Promise<void> => {
       // 对于文本文件，需要下载内容进行预览
       const fileData: number[] = await fileApi.downloadFile(
           props.configId,
+          props.bucket,
           `${props.currentPath}${props.file.name}`
       );
 
@@ -109,6 +111,7 @@ const previewFileContent = async (): Promise<void> => {
       // 对于图片和视频，获取授权访问链接
       previewContent.value = await fileApi.getFilePreviewUrl(
           props.configId,
+          props.bucket,
           `${props.currentPath}${props.file.name.replace('/', '')}`
       );
     } else if (fileType === FileType.Parquet) {
@@ -121,6 +124,7 @@ const previewFileContent = async (): Promise<void> => {
 
       const fileData: number[] = await fileApi.downloadFile(
           props.configId,
+          props.bucket,
           `${props.currentPath}${props.file.name}`
       );
       const parquetBuffer = new Uint8Array(fileData);
@@ -145,13 +149,22 @@ const previewFileContent = async (): Promise<void> => {
         customHeaderCell: () => ({style: parquetColumnStyle}),
       }));
 
+      const stringifyCellValue = (value: unknown): string => {
+        return JSON.stringify(value, (_key, nestedValue) => {
+          if (typeof nestedValue === 'bigint') return nestedValue.toString();
+          if (nestedValue instanceof Date) return nestedValue.toISOString();
+          if (nestedValue instanceof Uint8Array) return `Uint8Array(${nestedValue.length})`;
+          return nestedValue;
+        });
+      };
+
       const formatCellValue = (value: unknown): unknown => {
         if (value === null || value === undefined) return '';
         if (typeof value === 'bigint') return value.toString();
         if (value instanceof Date) return value.toISOString();
         if (value instanceof Uint8Array) return `Uint8Array(${value.length})`;
-        if (Array.isArray(value)) return JSON.stringify(value);
-        if (typeof value === 'object') return JSON.stringify(value);
+        if (Array.isArray(value)) return stringifyCellValue(value);
+        if (typeof value === 'object') return stringifyCellValue(value);
         return value;
       };
 

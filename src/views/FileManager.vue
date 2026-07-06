@@ -28,6 +28,7 @@ const route = useRoute()
 // 状态变量
 const configList = ref<OssConfig[]>([])
 const selectedConfig = ref<string>('')
+const selectedBucket = ref<string>('')
 const currentPathParts = ref<string[]>([])
 const fileList = ref<FileItem[]>([])
 const searchValue = ref<string>('')
@@ -96,7 +97,18 @@ const loadConfigList = async (): Promise<void> => {
       selectedConfig.value = configList.value[0].id
     }
 
-    if (selectedConfig.value) {
+    if (route.params.bucket) {
+      selectedBucket.value = route.params.bucket as string
+    } else {
+      selectedBucket.value = configList.value.find(c => c.id === selectedConfig.value)?.bucket || ''
+    }
+
+    if (selectedConfig.value && !selectedBucket.value) {
+      await router.push({name: 'BucketList', params: {id: selectedConfig.value}})
+      return
+    }
+
+    if (selectedConfig.value && selectedBucket.value) {
       await loadFileList()
     }
   } catch (error) {
@@ -107,7 +119,7 @@ const loadConfigList = async (): Promise<void> => {
 
 // 加载文件列表 - 支持分页
 const loadFileList = async (append = false): Promise<void> => {
-  if (!selectedConfig.value) return
+  if (!selectedConfig.value || !selectedBucket.value) return
 
   // 区分初始加载和上拉加载
   if (!append) {
@@ -121,6 +133,7 @@ const loadFileList = async (append = false): Promise<void> => {
   try {
     const result: FileList = await fileApi.listFile(
         selectedConfig.value,
+        selectedBucket.value,
         currentPath.value,
         append ? nextToken.value || '' : ''
     )
@@ -183,8 +196,9 @@ const getParentRemotePath = (path: string): string => {
   return lastSlashIndex >= 0 ? `${normalized.slice(0, lastSlashIndex)}/` : ''
 }
 
-const handleUploadCompleted = async ({configId, uploadPath}: UploadCompletedPayload): Promise<void> => {
+const handleUploadCompleted = async ({configId, bucket, uploadPath}: UploadCompletedPayload): Promise<void> => {
   if (configId !== selectedConfig.value) return
+  if (bucket !== selectedBucket.value) return
 
   const current = normalizeRemotePath(currentPath.value)
   const uploaded = normalizeRemotePath(uploadPath)
@@ -256,6 +270,7 @@ const deleteFile = async (file: FileItem): Promise<void> => {
     showLoading(`正在${file.isDir ? '递归删除目录' : '删除文件'}...`)
     await fileApi.deleteFile(
         selectedConfig.value,
+        selectedBucket.value,
         getCompletePath(file)
     )
     message.success('删除成功！')
@@ -271,8 +286,7 @@ const deleteFile = async (file: FileItem): Promise<void> => {
 const copyFilePath = async (file: FileItem): Promise<void> => {
   try {
     const keyPath = getCompletePath(file)
-    const bucket = configList.value.find(c => c.id === selectedConfig.value)?.bucket || ''
-    const fullPath = bucket ? `${bucket}/${keyPath}` : keyPath
+    const fullPath = selectedBucket.value ? `${selectedBucket.value}/${keyPath}` : keyPath
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(fullPath)
     } else {
@@ -333,11 +347,22 @@ const selectFolders = async () => {
 
 // 更新onConfigChange方法，确保在配置改变时重置路径
 const onConfigChange = async (id: string): Promise<void> => {
-  await router.push({name: "FileManager", params: {id}})
   selectedConfig.value = id
+  const bucket = configList.value.find(c => c.id === id)?.bucket || ''
+  selectedBucket.value = bucket
+  if (!bucket) {
+    await router.push({name: 'BucketList', params: {id}})
+    return
+  }
+  await router.push({name: "FileManager", params: {id, bucket}})
   currentPathParts.value = []
   resetSearch()
   await loadFileList()
+}
+
+const goToBucketList = async (): Promise<void> => {
+  if (!selectedConfig.value) return
+  await router.push({name: 'BucketList', params: {id: selectedConfig.value}})
 }
 
 // 添加返回配置列表的方法
@@ -416,6 +441,9 @@ onUnmounted(() => {
             {{ config.name }}
           </a-select-option>
         </a-select>
+        <a-button v-if="selectedBucket" @click="goToBucketList" title="切换存储桶">
+          {{ selectedBucket }}
+        </a-button>
       </div>
       <div class="header-right button-group">
         <a-input class="search-input"
@@ -515,6 +543,7 @@ onUnmounted(() => {
         v-model:visible="previewVisible"
         :file="previewFile"
         :config-id="selectedConfig"
+        :bucket="selectedBucket"
         :current-path="currentPath"
         @close="closePreview"
         @download="downloadFile"
@@ -523,6 +552,7 @@ onUnmounted(() => {
     <TransferIndicator
         ref="transferRef"
         :config_id="selectedConfig"
+        :bucket="selectedBucket"
         :upload_path="currentPath"
         @upload-completed="handleUploadCompleted"
     />
