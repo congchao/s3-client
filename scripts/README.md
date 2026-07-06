@@ -98,3 +98,18 @@ yarn.cmd package:win:amd64
 ```
 
 If MSBuild reports `DirectoryNotFoundException` for a deep `CMakeScratch\...\*.tlog` path, it is usually a Windows path length issue. The Windows package script sets `CARGO_TARGET_DIR=C:\s3-client-target` by default to keep build paths short. You can also extract the project to a shorter directory such as `C:\src\s3-client`.
+
+If a basic Rust dependency such as `hex` fails with errors like `cannot find type Result`, `cannot find Ok`, or `cannot find Err`, the Cargo registry cache or Rust environment is likely corrupted. Clear the affected caches and retry:
+
+```powershell
+Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue
+Remove-Item Env:\CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
+Remove-Item Env:\RUSTC_WRAPPER -ErrorAction SilentlyContinue
+Remove-Item Env:\RUSTC_WORKSPACE_WRAPPER -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force C:\s3-client-target
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cargo\registry\src"
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cargo\registry\cache"
+rustup update stable
+rustup target add x86_64-pc-windows-msvc
+yarn.cmd package:win:amd64
+```

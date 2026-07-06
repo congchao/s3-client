@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $RootDir = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Target = "x86_64-pc-windows-msvc"
-$DefaultTargetDir = "C:\s3-client-target"
+$DefaultTargetDir = "D:\s3-client-target"
 
 function Invoke-Checked {
     param(
@@ -76,6 +76,12 @@ if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
 New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR | Out-Null
 Write-Host "Using Cargo target dir: $env:CARGO_TARGET_DIR"
 
+Write-Host "Clearing Rust environment variables that can pollute dependency builds"
+Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue
+Remove-Item Env:\CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
+Remove-Item Env:\RUSTC_WRAPPER -ErrorAction SilentlyContinue
+Remove-Item Env:\RUSTC_WORKSPACE_WRAPPER -ErrorAction SilentlyContinue
+
 if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
     Write-Error "rustup was not found. Install Rust first: https://www.rust-lang.org/tools/install"
 }
@@ -83,6 +89,10 @@ if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command yarn -ErrorAction SilentlyContinue)) {
     Write-Error "yarn was not found. Install Node.js and Yarn first."
 }
+
+Write-Host "Rust toolchain:"
+Invoke-Checked rustc -vV
+Invoke-Checked cargo -vV
 
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     Write-Error "cmake was not found. Install CMake and make sure it is available in PATH. For example: winget install Kitware.CMake"
