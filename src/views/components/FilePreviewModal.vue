@@ -26,6 +26,8 @@ interface Emits {
   (e: 'close'): void;
 
   (e: 'download', file: FileItem): void;
+
+  (e: 'parquet-to-excel', file: FileItem): void;
 }
 
 const props = defineProps<Props>();
@@ -75,6 +77,8 @@ const tableColumnStyle = {
 let parquetWasmInitPromise: ReturnType<typeof initWasm> | null = null;
 const previewContainer = useTemplateRef('previewContainer')
 let tblHeight = ref<number>(0)
+const parquetTableHeight = computed<number>(() => Math.max(220, tblHeight.value - 128));
+const parquetSchemaHeight = computed<number>(() => Math.max(220, tblHeight.value - 56));
 
 // 计算属性：控制模态框显示
 const previewVisible = computed<boolean>({
@@ -415,6 +419,12 @@ const downloadPreviewFile = async (): Promise<void> => {
   }
 };
 
+const exportParquetToExcel = async (): Promise<void> => {
+  if (props.file && getFileType(props.file.name) === FileType.Parquet) {
+    emit('parquet-to-excel', props.file);
+  }
+};
+
 // 处理媒体文件错误
 const handleImageError = () => {
   console.error('图片加载失败');
@@ -523,34 +533,38 @@ watch(
           <p>Parquet 解析失败：{{ parquetError }}</p>
         </div>
         <div class="preview-parquet-content" v-else>
-          <a-tabs size="small">
+          <a-tabs class="parquet-tabs" size="small">
             <a-tab-pane key="data" tab="数据">
-          <div class="preview-parquet-meta">
-            <span>共 {{ parquetTotalRows }} 行</span>
-          </div>
-          <a-table
-              class="fixed-preview-table parquet-preview-table"
-              :columns="parquetColumns"
-              :data-source="parquetRows"
-              :pagination="false"
-              bordered
-              size="small"
-              row-key="__key"
-              table-layout="fixed"
-              :scroll="{ x:  'max-content',y: tblHeight }"
-          />
-          <a-flex class="parquet-pagination" justify="end">
-            <a-pagination
-                v-model:current="parquetPage"
-                v-model:page-size="parquetPageSize"
-                :total="parquetTotalRows"
-                :page-size-options="['50', '100', '200', '500']"
-                show-size-changer
-                show-less-items
-                @change="updateParquetPageRows"
-                @showSizeChange="updateParquetPageRows"
-            />
-          </a-flex>
+              <div class="parquet-data-pane">
+                <div class="preview-parquet-meta">
+                  <span>共 {{ parquetTotalRows }} 行</span>
+                </div>
+                <div class="parquet-table-wrap">
+                  <a-table
+                      class="fixed-preview-table parquet-preview-table"
+                      :columns="parquetColumns"
+                      :data-source="parquetRows"
+                      :pagination="false"
+                      bordered
+                      size="small"
+                      row-key="__key"
+                      table-layout="fixed"
+                      :scroll="{ x:  'max-content', y: parquetTableHeight }"
+                  />
+                </div>
+                <a-flex class="parquet-pagination" justify="end">
+                  <a-pagination
+                      v-model:current="parquetPage"
+                      v-model:page-size="parquetPageSize"
+                      :total="parquetTotalRows"
+                      :page-size-options="['50', '100', '200', '500']"
+                      show-size-changer
+                      show-less-items
+                      @change="updateParquetPageRows"
+                      @showSizeChange="updateParquetPageRows"
+                  />
+                </a-flex>
+              </div>
             </a-tab-pane>
             <a-tab-pane key="schema" tab="Schema">
               <a-table
@@ -564,7 +578,7 @@ watch(
                   bordered
                   size="small"
                   row-key="__key"
-                  :scroll="{ y: tblHeight }"
+                  :scroll="{ y: parquetSchemaHeight }"
               />
             </a-tab-pane>
           </a-tabs>
@@ -586,6 +600,12 @@ watch(
 
     <!-- 下载按钮 -->
     <div class="preview-download-row" v-if="previewType !== FileType.Other">
+      <a-button
+          v-if="previewType === FileType.Parquet && !parquetPreviewTooLarge"
+          @click="exportParquetToExcel"
+      >
+        Parquet 转 Excel
+      </a-button>
       <a-button type="primary" @click="downloadPreviewFile">
         <DownloadOutlined/>
         下载文件
@@ -699,6 +719,7 @@ watch(
 .preview-parquet-container, .preview-parquet-content {
   width: 100%;
   height: 100%;
+  min-height: 0;
 }
 
 .preview-parquet-large {
@@ -712,6 +733,16 @@ watch(
 }
 
 .preview-parquet-content, .preview-csv-content {
+  overflow: hidden;
+
+  :deep(.parquet-tabs),
+  :deep(.parquet-tabs > .ant-tabs-content-holder),
+  :deep(.parquet-tabs > .ant-tabs-content-holder > .ant-tabs-content),
+  :deep(.parquet-tabs > .ant-tabs-content-holder > .ant-tabs-content > .ant-tabs-tabpane) {
+    height: 100%;
+    min-height: 0;
+  }
+
   :deep(.fixed-preview-table .ant-table table) {
     table-layout: fixed !important;
   }
@@ -741,14 +772,29 @@ watch(
   }
 }
 
+.parquet-data-pane {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.parquet-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .parquet-pagination {
-  padding-top: 12px;
+  flex: 0 0 auto;
+  padding: 12px 0 0;
+  background: #fff;
 }
 
 .preview-container {
   flex: 1;
   overflow: hidden;
-  overflow-y: auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -757,5 +803,6 @@ watch(
 .preview-download-row {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
 }
 </style>

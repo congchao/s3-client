@@ -13,6 +13,7 @@ pub struct OssConfig {
     pub region: String,
     pub bucket: String,
     pub path_style: String,
+    pub sort: i64,
 }
 
 // 为 OssConfig 实现默认值
@@ -28,6 +29,7 @@ impl Default for OssConfig {
             region: "cn-north-1".to_string(),
             bucket: "".to_string(),
             path_style: "".to_string(),
+            sort: 0,
         }
     }
 }

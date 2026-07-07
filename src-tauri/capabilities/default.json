@@ -10,6 +10,7 @@
     "dialog:allow-open",
     "fs:allow-write",
     "fs:allow-download-write",
+    "clipboard-manager:allow-read-text",
     "core:event:default"
   ]
 }

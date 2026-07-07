@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {h, onMounted, reactive, ref} from 'vue'
 import {useRoute, useRouter} from 'vue-router'
-import {message, Modal} from 'ant-design-vue'
+import {message} from 'ant-design-vue'
 import {ArrowLeftOutlined, CheckOutlined, SyncOutlined} from '@ant-design/icons-vue'
 import {configApi} from '@/services/config.ts'
 import {OssConfig} from '@/types/index.d'
@@ -25,6 +25,7 @@ const basicForm = reactive<OssConfig>({
   endpoint: '',
   bucket: '',
   pathStyle: 'path',
+  sort: 0,
 })
 
 // 表单校验规则
@@ -45,29 +46,7 @@ const isEdit = ref<boolean>(!!route.params.id)
 
 // 返回上一页
 const goBack = (): void => {
-  // 未保存校验
-  // 检查是否有任何关键字段被填写
-  const hasUnsavedChanges = basicForm.name.trim() !== '' ||
-      basicForm.provider.trim() !== '' ||
-      basicForm.region.trim() !== '' ||
-      basicForm.accessKey.trim() !== '' ||
-      basicForm.secretKey.trim() !== '' ||
-      basicForm.endpoint.trim() !== '' ||
-      basicForm.bucket.trim() !== ''
-
-  if (hasUnsavedChanges) {
-    Modal.confirm({
-      title: '提示',
-      content: '配置未保存，确定返回吗？',
-      okText: '确定',
-      cancelText: '取消',
-      onOk: () => {
-        router.push({name: 'ConfigList'})
-      },
-    })
-  } else {
-    router.push({name: 'ConfigList'})
-  }
+  router.push({name: 'ConfigList'})
 }
 
 // 测试连接
@@ -87,6 +66,7 @@ const testConnection = async (): Promise<void> => {
       endpoint: basicForm.endpoint,
       bucket: basicForm.bucket.trim(),
       pathStyle: basicForm.pathStyle,
+      sort: basicForm.sort || 0,
     }
 
     // 调用后端测试连接命令
@@ -120,6 +100,7 @@ const save = async (): Promise<void> => {
       endpoint: basicForm.endpoint,
       bucket: basicForm.bucket.trim(),
       pathStyle: basicForm.pathStyle,
+      sort: basicForm.sort || 0,
     }
 
     // 调用后端命令保存配置
@@ -154,6 +135,7 @@ onMounted(async () => {
           endpoint: config.endpoint,
           bucket: config.bucket,
           pathStyle: config.pathStyle || 'path',
+          sort: config.sort || 0,
         })
       }
     } catch (error) {
@@ -176,6 +158,7 @@ onMounted(async () => {
           endpoint: config.endpoint,
           bucket: config.bucket,
           pathStyle: config.pathStyle || 'path',
+          sort: 0,
         })
       } else {
         message.error('未找到要复制的配置')

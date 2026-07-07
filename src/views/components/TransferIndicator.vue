@@ -203,6 +203,7 @@ const canCancel = (item: TransferProgress): boolean => {
 }
 
 const canRetry = (item: TransferProgress): boolean => {
+  if (item.from_path.startsWith('Parquet ')) return false
   return item.status === 'failed'
 }
 
@@ -261,18 +262,32 @@ const upload = async (local_paths: string[]) => {
 
 const download = async (remoteKeys: string[], localPath: string) => {
   try {
-    console.log(remoteKeys,localPath)
     const result: TransferProgress[] = await fileApi.downloadFilePath(
         props.config_id,
         props.bucket,
         remoteKeys,
         localPath
     );
-    console.log(result)
     downloadItems.value.push(...result)
   } catch (error) {
     console.error('下载启动失败:', error);
     message.error('下载启动失败');
+  }
+}
+
+const exportParquetXlsx = async (remoteKey: string, outputPath: string) => {
+  try {
+    const result = await fileApi.exportParquetXlsx(
+        props.config_id,
+        props.bucket,
+        remoteKey,
+        outputPath
+    )
+    downloadItems.value.push(result)
+    activeTab.value = 'download'
+  } catch (error) {
+    console.error('Parquet 导出启动失败:', error)
+    message.error(`Parquet 导出启动失败: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
@@ -329,7 +344,8 @@ onUnmounted(() => {
 })
 defineExpose({
   upload,
-  download
+  download,
+  exportParquetXlsx
 })
 </script>
 

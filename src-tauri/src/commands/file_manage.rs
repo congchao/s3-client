@@ -1,5 +1,9 @@
 use crate::models::{TransferProgress, TransferStatus};
 use crate::utils::{BucketInfo, BucketPermissions, FileList, Oss};
+use arrow_cast::display::array_value_to_string;
+use bytes::Bytes;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rust_xlsxwriter::{Workbook, Worksheet};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -14,9 +18,17 @@ use uuid::Uuid;
 const MAX_CONCURRENT: usize = 5;
 const TRANSFER_QUEUE_CAPACITY: usize = 1000;
 const PREVIEW_DOWNLOAD_MAX_SIZE: i64 = 10 * 1024 * 1024;
+const EXCEL_MAX_CELL_CHARS: usize = 32_767;
 
 struct TransferJob {
     task: TransferProgress,
+    app: AppHandle,
+    cancellation_token: CancellationToken,
+}
+
+struct ParquetExportJob {
+    task: TransferProgress,
+    source_keys: Vec<String>,
     app: AppHandle,
     cancellation_token: CancellationToken,
 }
@@ -25,6 +37,7 @@ struct TransferJob {
 struct TransferSystem {
     upload_tx: mpsc::Sender<TransferJob>,
     download_tx: mpsc::Sender<TransferJob>,
+    parquet_export_tx: mpsc::Sender<ParquetExportJob>,
 }
 
 static TRANSFER_CANCELLATIONS: LazyLock<Mutex<HashMap<String, CancellationToken>>> =
@@ -34,6 +47,8 @@ static TRANSFER_CANCELLATIONS: LazyLock<Mutex<HashMap<String, CancellationToken>
 static TRANSFER_SYSTEM: LazyLock<TransferSystem> = LazyLock::new(|| {
     let (upload_tx, mut upload_rx) = mpsc::channel::<TransferJob>(TRANSFER_QUEUE_CAPACITY);
     let (download_tx, mut download_rx) = mpsc::channel::<TransferJob>(TRANSFER_QUEUE_CAPACITY);
+    let (parquet_export_tx, mut parquet_export_rx) =
+        mpsc::channel::<ParquetExportJob>(TRANSFER_QUEUE_CAPACITY);
 
     tokio::spawn(async move {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
@@ -76,9 +91,32 @@ static TRANSFER_SYSTEM: LazyLock<TransferSystem> = LazyLock::new(|| {
         }
     });
 
+    tokio::spawn(async move {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        while let Some(job) = parquet_export_rx.recv().await {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            tokio::spawn(async move {
+                let ParquetExportJob {
+                    task,
+                    source_keys,
+                    app,
+                    cancellation_token,
+                } = job;
+                if let Err(e) =
+                    perform_parquet_export(task.clone(), source_keys, app, cancellation_token).await
+                {
+                    eprintln!("Parquet 导出任务失败: {}, 错误: {}", task.from_path, e);
+                }
+                unregister_transfer_task(&task.id);
+                drop(permit);
+            });
+        }
+    });
+
     TransferSystem {
         upload_tx,
         download_tx,
+        parquet_export_tx,
     }
 });
 
@@ -203,6 +241,187 @@ async fn perform_download(
         let _ = app.emit("transfer_process", task);
         return Err(format!("下载失败: {}", e));
     }
+    Ok(())
+}
+
+async fn perform_parquet_export(
+    mut task: TransferProgress,
+    source_keys: Vec<String>,
+    app: AppHandle,
+    cancellation_token: CancellationToken,
+) -> Result<(), String> {
+    if cancellation_token.is_cancelled() {
+        emit_cancelled(task, app);
+        return Ok(());
+    }
+
+    let oss = Oss::new_cached(&task.config_id).map_err(|e| e.to_string())?;
+    task.status = TransferStatus::Downloading;
+    let _ = app.emit("transfer_process", &task);
+
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name("Parquet").map_err(|e| e.to_string())?;
+
+    let mut headers = HashMap::new();
+    ensure_xlsx_header(worksheet, &mut headers, "来源文件")?;
+    let mut next_row = 1u32;
+    let total = source_keys.len().max(1);
+
+    for (index, key) in source_keys.iter().enumerate() {
+        if cancellation_token.is_cancelled() {
+            emit_cancelled(task, app);
+            return Ok(());
+        }
+
+        let response = match oss.get_object(&task.bucket, key).await {
+            Ok(response) => response,
+            Err(e) => {
+                if cancellation_token.is_cancelled() {
+                    emit_cancelled(task, app);
+                    return Ok(());
+                }
+                task.status = TransferStatus::Failed;
+                let _ = app.emit("transfer_process", &task);
+                return Err(e.to_string());
+            }
+        };
+        let body = match response.body.collect().await {
+            Ok(body) => body,
+            Err(e) => {
+                if cancellation_token.is_cancelled() {
+                    emit_cancelled(task, app);
+                    return Ok(());
+                }
+                task.status = TransferStatus::Failed;
+                let _ = app.emit("transfer_process", &task);
+                return Err(e.to_string());
+            }
+        };
+        if let Err(e) = write_parquet_bytes_to_worksheet(
+            body.into_bytes().to_vec(),
+            key,
+            worksheet,
+            &mut headers,
+            &mut next_row,
+            &cancellation_token,
+        ) {
+            if cancellation_token.is_cancelled() {
+                emit_cancelled(task, app);
+                return Ok(());
+            }
+            task.status = TransferStatus::Failed;
+            let _ = app.emit("transfer_process", &task);
+            return Err(e);
+        }
+
+        task.progress = ((index + 1) as f64 / total as f64) * 100.0;
+        if task.progress >= 100.0 {
+            task.progress = 100.0;
+        }
+        let _ = app.emit("transfer_process", &task);
+    }
+
+    if let Some(parent) = Path::new(&task.to_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    if let Err(e) = workbook.save(&task.to_path) {
+        if cancellation_token.is_cancelled() {
+            emit_cancelled(task, app);
+            return Ok(());
+        }
+        task.status = TransferStatus::Failed;
+        let _ = app.emit("transfer_process", &task);
+        return Err(e.to_string());
+    }
+    task.status = TransferStatus::Completed;
+    task.progress = 100.0;
+    let _ = app.emit("transfer_process", task);
+    Ok(())
+}
+
+fn ensure_xlsx_header(
+    worksheet: &mut Worksheet,
+    headers: &mut HashMap<String, u16>,
+    name: &str,
+) -> Result<u16, String> {
+    if let Some(column) = headers.get(name) {
+        return Ok(*column);
+    }
+
+    let column = u16::try_from(headers.len()).map_err(|_| "Excel 列数量超过限制".to_string())?;
+    write_xlsx_string(worksheet, 0, column, name)?;
+    headers.insert(name.to_string(), column);
+    Ok(column)
+}
+
+fn truncate_xlsx_cell_value(value: &str) -> String {
+    if value.chars().count() <= EXCEL_MAX_CELL_CHARS {
+        return value.to_string();
+    }
+
+    value.chars().take(EXCEL_MAX_CELL_CHARS).collect()
+}
+
+fn write_xlsx_string(
+    worksheet: &mut Worksheet,
+    row: u32,
+    column: u16,
+    value: &str,
+) -> Result<(), String> {
+    let value = truncate_xlsx_cell_value(value);
+    worksheet
+        .write_string(row, column, &value)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn write_parquet_bytes_to_worksheet(
+    parquet_bytes: Vec<u8>,
+    source_key: &str,
+    worksheet: &mut Worksheet,
+    headers: &mut HashMap<String, u16>,
+    next_row: &mut u32,
+    cancellation_token: &CancellationToken,
+) -> Result<(), String> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parquet_bytes))
+        .map_err(|e| e.to_string())?;
+    let mut reader = builder
+        .with_batch_size(1024)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let source_column = ensure_xlsx_header(worksheet, headers, "来源文件")?;
+
+    for batch in &mut reader {
+        if cancellation_token.is_cancelled() {
+            return Err("任务已取消".to_string());
+        }
+
+        let batch = batch.map_err(|e| e.to_string())?;
+        let fields = batch.schema().fields().clone();
+        let mut field_columns = Vec::with_capacity(fields.len());
+        for field in fields.iter() {
+            field_columns.push(ensure_xlsx_header(worksheet, headers, field.name())?);
+        }
+
+        for row_index in 0..batch.num_rows() {
+            if cancellation_token.is_cancelled() {
+                return Err("任务已取消".to_string());
+            }
+
+            write_xlsx_string(worksheet, *next_row, source_column, source_key)?;
+            for (column_index, column) in batch.columns().iter().enumerate() {
+                let value =
+                    array_value_to_string(column.as_ref(), row_index).map_err(|e| e.to_string())?;
+                write_xlsx_string(worksheet, *next_row, field_columns[column_index], &value)?;
+            }
+            *next_row = next_row
+                .checked_add(1)
+                .ok_or_else(|| "Excel 行数量超过限制".to_string())?;
+        }
+    }
+
     Ok(())
 }
 
@@ -556,6 +775,69 @@ pub async fn file_download_path(
 }
 
 #[tauri::command]
+pub async fn file_export_parquet_xlsx(
+    id: String,
+    bucket: String,
+    key: String,
+    output_path: String,
+    app_handle: AppHandle,
+) -> Result<TransferProgress, String> {
+    let oss = Oss::new_cached(&id).map_err(|e| e.to_string())?;
+    let source_keys = if key.ends_with('/') {
+        oss.list_all_object_keys(&bucket, &key)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|item| item.to_lowercase().ends_with(".parquet"))
+            .collect::<Vec<_>>()
+    } else if key.to_lowercase().ends_with(".parquet") {
+        vec![key.clone()]
+    } else {
+        Vec::new()
+    };
+
+    if source_keys.is_empty() {
+        return Err("未找到可导出的 Parquet 文件".to_string());
+    }
+
+    let task = TransferProgress {
+        id: Uuid::new_v4().to_string(),
+        config_id: id,
+        bucket,
+        name: Path::new(&output_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        from_path: if key.ends_with('/') {
+            format!("Parquet 目录导出: {}", key)
+        } else {
+            key
+        },
+        to_path: output_path,
+        size: source_keys.len() as u64,
+        progress: 0.0,
+        status: TransferStatus::Waiting,
+    };
+
+    let cancellation_token = register_transfer_task(&task.id)?;
+    if let Err(e) = TRANSFER_SYSTEM
+        .parquet_export_tx
+        .try_send(ParquetExportJob {
+            task: task.clone(),
+            source_keys,
+            app: app_handle,
+            cancellation_token,
+        })
+    {
+        unregister_transfer_task(&task.id);
+        return Err(format!("传输队列已满，无法添加 Parquet 导出任务: {}", e));
+    }
+
+    Ok(task)
+}
+
+#[tauri::command]
 pub async fn file_transfer_cancel(task_id: String) -> Result<(), String> {
     let cancellations = TRANSFER_CANCELLATIONS
         .lock()
@@ -628,7 +910,7 @@ fn create_download_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_upload_key, safe_local_destination};
+    use super::{build_upload_key, safe_local_destination, truncate_xlsx_cell_value};
     use std::path::PathBuf;
 
     #[test]
@@ -658,5 +940,13 @@ mod tests {
         assert!(safe_local_destination("/tmp/download", "", "../secret.txt").is_err());
         assert!(safe_local_destination("/tmp/download", "", "dir/../secret.txt").is_err());
         assert!(safe_local_destination("/tmp/download", "", "dir\\secret.txt").is_err());
+    }
+
+    #[test]
+    fn truncates_xlsx_cell_value_to_excel_limit() {
+        let value = "好".repeat(40_000);
+        let truncated = truncate_xlsx_cell_value(&value);
+        assert_eq!(truncated.chars().count(), 32_767);
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 }

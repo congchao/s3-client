@@ -1,10 +1,12 @@
 <template>
   <div
       v-if="visible"
+      ref="menuRef"
       class="custom-context-menu context-menu-style"
-      :style="{ top: y + 'px', left: x + 'px' }"
+      :style="{ top: menuPosition.y + 'px', left: menuPosition.x + 'px' }"
   >
     <a-button
+        v-if="menuSettings.download"
         type="link"
         size="small"
         @click="handleDownload"
@@ -12,6 +14,7 @@
       下载
     </a-button>
     <a-button
+        v-if="menuSettings.rename"
         type="link"
         size="small"
         @click="handleRename"
@@ -19,6 +22,7 @@
       重命名
     </a-button>
     <a-button
+        v-if="menuSettings.moveItem"
         type="link"
         size="small"
         @click="handleMove"
@@ -26,6 +30,7 @@
       移动
     </a-button>
     <a-button
+        v-if="menuSettings.duplicate"
         type="link"
         size="small"
         @click="handleDuplicate"
@@ -33,7 +38,7 @@
       复制对象
     </a-button>
     <a-button
-        v-if="!file?.isDir"
+        v-if="!file?.isDir && menuSettings.share"
         type="link"
         size="small"
         @click="handleShare"
@@ -41,6 +46,15 @@
       预签名链接
     </a-button>
     <a-button
+        v-if="menuSettings.parquetToExcel && (file?.isDir || isParquetFile)"
+        type="link"
+        size="small"
+        @click="handleParquetToExcel"
+    >
+      Parquet 转 Excel
+    </a-button>
+    <a-button
+        v-if="menuSettings.delete"
         type="link"
         size="small"
         @click="handleDelete"
@@ -48,6 +62,7 @@
       删除
     </a-button>
     <a-button
+        v-if="menuSettings.copyPath"
         type="link"
         size="small"
         @click="handleCopy"
@@ -59,7 +74,8 @@
 
 <script setup lang="ts">
 import {FileItem} from '@/types';
-import {ref} from 'vue';
+import {computed, nextTick, reactive, ref, watch} from 'vue';
+import {ContextMenuSettings} from '@/types';
 
 // 定义 props
 interface Props {
@@ -67,6 +83,7 @@ interface Props {
   x: number;
   y: number;
   file: FileItem | null;
+  settings: ContextMenuSettings;
 }
 
 // 定义 emits
@@ -86,14 +103,46 @@ interface Emits {
   (e: 'duplicate', file: FileItem): void;
 
   (e: 'share', file: FileItem): void;
+
+  (e: 'parquet-to-excel', file: FileItem): void;
 }
 
 const props = defineProps<Props>();
 const emit = defineEmits<Emits>();
 
 // 内部状态
-const contextVisible = ref<boolean>(props.visible);
+const menuRef = ref<HTMLElement | null>(null);
+const menuPosition = reactive({x: props.x, y: props.y});
+const menuSettings = computed(() => props.settings);
+const isParquetFile = computed(() => props.file?.name.toLowerCase().endsWith('.parquet') ?? false);
 
+const updateMenuPosition = async (): Promise<void> => {
+  menuPosition.x = props.x;
+  menuPosition.y = props.y;
+  if (!props.visible) return;
+
+  await nextTick();
+
+  const menuEl = menuRef.value;
+  if (!menuEl) return;
+
+  const margin = 8;
+  const width = menuEl.offsetWidth;
+  const height = menuEl.offsetHeight;
+  const maxX = window.innerWidth - width - margin;
+  const maxY = window.innerHeight - height - margin;
+
+  menuPosition.x = Math.max(margin, Math.min(props.x, maxX));
+  menuPosition.y = Math.max(margin, Math.min(props.y, maxY));
+};
+
+watch(
+    () => [props.visible, props.x, props.y, props.file, props.settings] as const,
+    () => {
+      updateMenuPosition();
+    },
+    {immediate: true}
+);
 
 // 处理下载事件
 const handleDownload = () => {
@@ -147,9 +196,15 @@ const handleShare = () => {
   }
 };
 
+const handleParquetToExcel = () => {
+  if (props.file) {
+    emit('parquet-to-excel', props.file);
+    hideMenu();
+  }
+};
+
 // 隐藏菜单
 const hideMenu = () => {
-  contextVisible.value = false;
   emit('update:visible', false);
 };
 </script>

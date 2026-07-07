@@ -58,6 +58,15 @@ const downloadFilePath = async (
     return await invoke<TransferProgress[]>('file_download_path', {id, bucket, remoteKeys, localPath});
 };
 
+const exportParquetXlsx = async (
+    id: string,
+    bucket: string,
+    key: string,
+    outputPath: string
+): Promise<TransferProgress> => {
+    return await invoke<TransferProgress>('file_export_parquet_xlsx', {id, bucket, key, outputPath});
+};
+
 const listBuckets = async (id: string): Promise<BucketInfo[]> => {
     return await invoke<BucketInfo[]>('bucket_list', {id});
 };
@@ -132,5 +141,6 @@ export const fileApi = {
     cancelTransfer,
     retryTransfer,
     listenTransferProgress,
-    downloadFilePath
+    downloadFilePath,
+    exportParquetXlsx
 };

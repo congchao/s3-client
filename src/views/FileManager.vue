@@ -11,8 +11,9 @@ import {
   UnorderedListOutlined,
   UploadOutlined
 } from '@ant-design/icons-vue'
-import {BucketPermissions, FileItem, FileList, OssConfig} from '@/types'
-import {open} from '@tauri-apps/plugin-dialog';
+import {AppSettings, BucketPermissions, ContextMenuSettings, FileItem, FileList, OssConfig} from '@/types'
+import {open, save} from '@tauri-apps/plugin-dialog';
+import {readText} from '@tauri-apps/plugin-clipboard-manager';
 import router from "@/router";
 import dayjs from "dayjs";
 import {showLoading} from '@/utils/loading.ts'
@@ -60,6 +61,22 @@ const shareModal = reactive({
   expiresSeconds: 3600,
   url: '',
   file: null as FileItem | null,
+})
+
+const defaultMenuSettings = (): ContextMenuSettings => ({
+  download: true,
+  rename: true,
+  moveItem: true,
+  duplicate: true,
+  share: true,
+  delete: true,
+  copyPath: true,
+  parquetToExcel: true,
+})
+
+const appSettings = reactive<AppSettings>({
+  fileContextMenu: defaultMenuSettings(),
+  directoryContextMenu: defaultMenuSettings(),
 })
 
 const currentPath = computed(() => {
@@ -115,6 +132,16 @@ const withDirectorySuffix = (key: string, isDir: boolean): string => {
   return normalized ? `${normalized}/` : ''
 }
 
+const loadAppSettings = async (): Promise<void> => {
+  try {
+    const result = await configApi.getSettings()
+    Object.assign(appSettings.fileContextMenu, result.fileContextMenu)
+    Object.assign(appSettings.directoryContextMenu, result.directoryContextMenu)
+  } catch (error) {
+    console.error('加载设置失败:', error)
+  }
+}
+
 // 预览文件 - 简化
 const previewFileContent = async (file: FileItem): Promise<void> => {
   if (file.isDir) return
@@ -140,6 +167,10 @@ const contextMenu = reactive({
   x: 0,
   y: 0,
   file: null as FileItem | null
+})
+
+const currentContextMenuSettings = computed(() => {
+  return contextMenu.file?.isDir ? appSettings.directoryContextMenu : appSettings.fileContextMenu
 })
 
 // 加载配置列表
@@ -297,6 +328,37 @@ const handleUploadCompleted = async ({configId, bucket, uploadPath}: UploadCompl
 const onSearch = (e: KeyboardEvent) => {
   if (e.keyCode === 229 || isComposing.value) {
     return
+  }
+}
+
+const pasteTextIntoSearch = (text: string, target?: EventTarget | null): void => {
+  if (!text) return
+  const input = target instanceof HTMLInputElement ? target : null
+  if (!input) {
+    searchValue.value = `${searchValue.value}${text}`
+    return
+  }
+
+  const start = input.selectionStart ?? searchValue.value.length
+  const end = input.selectionEnd ?? searchValue.value.length
+  searchValue.value = `${searchValue.value.slice(0, start)}${text}${searchValue.value.slice(end)}`
+  requestAnimationFrame(() => {
+    const cursor = start + text.length
+    input.setSelectionRange(cursor, cursor)
+  })
+}
+
+const handleSearchPasteShortcut = async (event: KeyboardEvent): Promise<void> => {
+  if (!((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'v')) return
+
+  event.preventDefault()
+  try {
+    const text = await readText()
+    if (!text) return
+    pasteTextIntoSearch(text, event.target)
+  } catch (error) {
+    console.error('读取剪贴板失败:', error)
+    message.warning('读取剪贴板失败')
   }
 }
 
@@ -512,6 +574,25 @@ const copyShareUrl = async (): Promise<void> => {
   message.success('链接已复制')
 }
 
+const exportParquetToExcel = async (file: FileItem): Promise<void> => {
+  if (!file.isDir && !file.name.toLowerCase().endsWith('.parquet')) return
+  if (!canRead.value) {
+    message.warning('当前账号没有读取权限')
+    return
+  }
+
+  const defaultExcelName = file.isDir
+      ? `${file.name.replace(/\/$/g, '') || 'parquet-folder'}.xlsx`
+      : file.name.replace(/\.parquet$/i, '.xlsx')
+  const outputPath = await save({
+    defaultPath: defaultExcelName,
+    filters: [{name: 'Excel 工作簿', extensions: ['xlsx']}],
+  })
+  if (!outputPath) return
+
+  await transferRef.value?.exportParquetXlsx(getCompletePath(file), outputPath)
+}
+
 const selectFiles = async () => {
   if (!ensureWritePermission()) return
   // 调用原生对话框，核心配置：同时开启 文件+文件夹 选择
@@ -602,7 +683,6 @@ const showContextMenu = (event: MouseEvent, file: FileItem | null) => {
   contextMenu.visible = true;
   contextMenu.x = event.clientX;
   contextMenu.y = event.clientY;
-  console.log(contextMenu)
 };
 
 // 隐藏右键菜单 - 简化
@@ -610,16 +690,23 @@ const hideContextMenu = () => {
   contextMenu.visible = false;
 };
 
+const handleAppSettingsSaved = (): void => {
+  loadAppSettings()
+}
+
 // 在组件挂载后添加事件监听
 onMounted(async () => {
+  await loadAppSettings()
   await loadConfigList()
   // 监听全局点击事件，点击其他地方时隐藏右键菜单
   window.addEventListener('click', hideContextMenu)
+  window.addEventListener('app-settings-saved', handleAppSettingsSaved)
 })
 
 // 在组件卸载前移除事件监听
 onUnmounted(() => {
   window.removeEventListener('click', hideContextMenu)
+  window.removeEventListener('app-settings-saved', handleAppSettingsSaved)
 })
 
 
@@ -666,6 +753,7 @@ onUnmounted(() => {
                  placeholder="搜索文件..."
                  style="width: 200px; margin-right: 12px;"
                  @keydown.enter.prevent="onSearch"
+                 @keydown="handleSearchPasteShortcut"
                  @compositionstart="isComposing = true"
                  @compositionend="isComposing = false"
         />
@@ -749,6 +837,7 @@ onUnmounted(() => {
         :x="contextMenu.x"
         :y="contextMenu.y"
         :file="contextMenu.file"
+        :settings="currentContextMenuSettings"
         @download="downloadFile"
         @delete="deleteFile"
         @copy="copyFilePath"
@@ -756,6 +845,7 @@ onUnmounted(() => {
         @move="(file) => openObjectOperation('move', file)"
         @duplicate="(file) => openObjectOperation('copy', file)"
         @share="openShareModal"
+        @parquet-to-excel="exportParquetToExcel"
     />
 
     <a-modal
@@ -814,6 +904,7 @@ onUnmounted(() => {
         :current-path="currentPath"
         @close="closePreview"
         @download="downloadFile"
+        @parquet-to-excel="exportParquetToExcel"
     />
     <!-- 进度条组件 -->
     <TransferIndicator

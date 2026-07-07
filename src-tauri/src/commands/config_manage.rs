@@ -1,4 +1,4 @@
-use crate::config::APP_CONFIG;
+use crate::config::{AppSettings, APP_CONFIG};
 use crate::models::OssConfig;
 use crate::utils::Oss;
 
@@ -16,6 +16,26 @@ pub async fn config_save(config: OssConfig) -> Result<(), String> {
 pub async fn config_get() -> Result<Vec<OssConfig>, String> {
     let app_config = APP_CONFIG.lock().map_err(|e| e.to_string())?;
     app_config.list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn config_sort_save(ids: Vec<String>) -> Result<(), String> {
+    let mut app_config = APP_CONFIG.lock().map_err(|e| e.to_string())?;
+    app_config.update_sort_order(ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn settings_get() -> Result<AppSettings, String> {
+    let app_config = APP_CONFIG.lock().map_err(|e| e.to_string())?;
+    app_config.get_settings().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn settings_save(settings: AppSettings) -> Result<(), String> {
+    let app_config = APP_CONFIG.lock().map_err(|e| e.to_string())?;
+    app_config
+        .save_settings(settings)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
